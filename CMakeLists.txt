@@ -1,7 +1,7 @@
 cmake_minimum_required( VERSION 3.5 )
 
 project( EOSIO )
-
+include(CTest) # suppresses DartConfiguration.tcl error
 enable_testing()
 
 if (CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
@@ -13,6 +13,16 @@ endif()
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/libraries/fc/CMakeModules")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules")
+
+if (UNIX)
+   if (APPLE)
+      execute_process(COMMAND xcrun --show-sdk-path
+                      OUTPUT_VARIABLE CMAKE_OSX_SYSROOT
+                      OUTPUT_STRIP_TRAILING_WHITESPACE)
+      list(APPEND CMAKE_PREFIX_PATH "/usr/local/opt/llvm@4")
+      list(APPEND CMAKE_PREFIX_PATH "/usr/local/opt/gettext")
+   endif()
+endif()
 
 include( GNUInstallDirs )
 include( VersionMacros )
@@ -26,8 +36,15 @@ set( CMAKE_CXX_EXTENSIONS ON )
 set( CXX_STANDARD_REQUIRED ON)
 
 set(VERSION_MAJOR 1)
-set(VERSION_MINOR 3)
+set(VERSION_MINOR 8)
 set(VERSION_PATCH 0)
+set(VERSION_SUFFIX develop)
+
+if(VERSION_SUFFIX)
+    set(VERSION_FULL "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}-${VERSION_SUFFIX}")
+else()
+    set(VERSION_FULL "${VERSION_MAJOR}.${VERSION_MINOR}.${VERSION_PATCH}")
+endif()
 
 set( CLI_CLIENT_EXECUTABLE_NAME cleos )
 set( NODE_EXECUTABLE_NAME nodeos )
@@ -41,22 +58,21 @@ if("${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU")
     if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 6.0)
         message(FATAL_ERROR "GCC version must be at least 6.0!")
     endif()
-elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
+    if ("${CMAKE_GENERATOR}" STREQUAL "Ninja")
+       add_compile_options(-fdiagnostics-color=always)
+    endif()
+elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" OR "${CMAKE_CXX_COMPILER_ID}" STREQUAL "AppleClang")
     if (CMAKE_CXX_COMPILER_VERSION VERSION_LESS 4.0)
         message(FATAL_ERROR "Clang version must be at least 4.0!")
     endif()
+    if ("${CMAKE_GENERATOR}" STREQUAL "Ninja")
+       add_compile_options(-fcolor-diagnostics)
+    endif()
 endif()
-
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS "ON")
 set(BUILD_DOXYGEN FALSE CACHE BOOL "Build doxygen documentation on every make")
 set(BUILD_MONGO_DB_PLUGIN FALSE CACHE BOOL "Build mongo database plugin")
-
-#set (USE_PCH 1)
-
-if (USE_PCH)
-  include (cotire)
-endif(USE_PCH)
 
 # add defaults for openssl
 if ("${OPENSSL_ROOT_DIR}" STREQUAL "")
@@ -99,7 +115,6 @@ FIND_PACKAGE(Boost 1.67 REQUIRED COMPONENTS
     filesystem
     system
     program_options
-    signals
     serialization
     chrono
     unit_test_framework
@@ -161,10 +176,6 @@ else( WIN32 ) # Apple AND Linux
         endif()
     endif( APPLE )
 
-    if( "${CMAKE_CXX_COMPILER_ID}" STREQUAL "GNU" )
-        set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-builtin-memcmp" )
-    endif()
-
     if( "${CMAKE_GENERATOR}" STREQUAL "Ninja" )
         if( "${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang" )
             set( CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcolor-diagnostics" )
@@ -181,12 +192,12 @@ set(ENABLE_COVERAGE_TESTING FALSE CACHE BOOL "Build EOSIO for code coverage anal
 
 if(ENABLE_COVERAGE_TESTING)
   SET(CMAKE_CXX_FLAGS "--coverage ${CMAKE_CXX_FLAGS}")
-  find_program( LCOV_PATH  lcov )
+  find_program( LCOV_PATH lcov )
   find_program( LLVMCOV_PATH  llvm-cov )
   find_program( GENHTML_PATH NAMES genhtml)
 endif()
 
-add_subdirectory( externals )
+include(utils)
 
 if ("${CORE_SYMBOL_NAME}" STREQUAL "")
   set( CORE_SYMBOL_NAME "SYS" )
@@ -206,10 +217,7 @@ endif()
 
 message( STATUS "Using '${EOSIO_ROOT_KEY}' as public key for 'eosio' account" )
 
-include(wasm)
-
 add_subdirectory( libraries )
-add_subdirectory( contracts )
 add_subdirectory( plugins )
 add_subdirectory( programs )
 add_subdirectory( scripts )
@@ -228,17 +236,47 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/testnet.template ${CMAKE_CURRENT_BINA
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/eosio.version.in ${CMAKE_CURRENT_BINARY_DIR}/eosio.version.hpp)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/eosio.version.hpp DESTINATION ${CMAKE_INSTALL_FULL_INCLUDEDIR})
 
-configure_file(${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/EosioTester.cmake.in ${CMAKE_CURRENT_BINARY_DIR}/EosioTester.cmake @ONLY)
-configure_file(${CMAKE_CURRENT_SOURCE_DIR}/CMakeModules/EosioTesterBuild.cmake.in ${CMAKE_BINARY_DIR}/lib/cmake/EosioTester.cmake @ONLY)
-install(FILES ${CMAKE_CURRENT_BINARY_DIR}/EosioTester.cmake DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}/cmake/)
+set(EOS_ROOT_DIR ${CMAKE_BINARY_DIR})
+configure_file(${CMAKE_SOURCE_DIR}/CMakeModules/eosio-config.cmake.in ${CMAKE_BINARY_DIR}/lib/cmake/eosio/eosio-config.cmake @ONLY)
+configure_file(${CMAKE_SOURCE_DIR}/CMakeModules/EosioTesterBuild.cmake.in ${CMAKE_BINARY_DIR}/lib/cmake/eosio/EosioTester.cmake @ONLY)
 
-install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/)
-install(FILES libraries/wabt/LICENSE DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.wabt)
-install(FILES libraries/softfloat/COPYING.txt DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.softfloat)
-install(FILES libraries/wasm-jit/LICENSE DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.wavm)
-install(FILES libraries/fc/secp256k1/upstream/COPYING DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.secp256k1)
-install(FILES externals/binaryen/LICENSE DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.binaryen)
+set(EOS_ROOT_DIR ${CMAKE_INSTALL_PREFIX})
+configure_file(${CMAKE_SOURCE_DIR}/CMakeModules/eosio-config.cmake.in ${CMAKE_BINARY_DIR}/modules/eosio-config.cmake @ONLY)
+install(FILES ${CMAKE_BINARY_DIR}/modules/eosio-config.cmake DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}/cmake/eosio)
+configure_file(${CMAKE_SOURCE_DIR}/CMakeModules/EosioTester.cmake.in ${CMAKE_BINARY_DIR}/modules/EosioTester.cmake @ONLY)
+install(FILES ${CMAKE_BINARY_DIR}/modules/EosioTester.cmake DESTINATION ${CMAKE_INSTALL_FULL_LIBDIR}/cmake/eosio)
 
-include(installer)
+configure_file(${CMAKE_SOURCE_DIR}/LICENSE
+               ${CMAKE_BINARY_DIR}/licenses/eosio/LICENSE COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/libraries/wabt/LICENSE
+               ${CMAKE_BINARY_DIR}/licenses/eosio/LICENSE.wabt COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/libraries/softfloat/COPYING.txt
+               ${CMAKE_BINARY_DIR}/licenses/eosio/LICENSE.softfloat COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/libraries/wasm-jit/LICENSE
+               ${CMAKE_BINARY_DIR}/licenses/eosio/LICENSE.wavm COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/libraries/fc/secp256k1/upstream/COPYING
+               ${CMAKE_BINARY_DIR}/licenses/eosio/LICENSE.secp256k1 COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/libraries/fc/src/network/LICENSE.go
+               ${CMAKE_BINARY_DIR}/licenses/eosio/LICENSE.go COPYONLY)
+configure_file(${CMAKE_SOURCE_DIR}/libraries/yubihsm/LICENSE
+               ${CMAKE_BINARY_DIR}/licenses/eosio/LICENSE.yubihsm COPYONLY)
 
+install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ COMPONENT base)
+install(FILES libraries/wabt/LICENSE DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.wabt COMPONENT base)
+install(FILES libraries/softfloat/COPYING.txt DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.softfloat COMPONENT base)
+install(FILES libraries/wasm-jit/LICENSE DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.wavm COMPONENT base)
+install(FILES libraries/fc/secp256k1/upstream/COPYING DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.secp256k1 COMPONENT base)
+install(FILES libraries/fc/src/network/LICENSE.go DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ COMPONENT base)
+install(FILES libraries/yubihsm/LICENSE DESTINATION ${CMAKE_INSTALL_FULL_DATAROOTDIR}/licenses/eosio/ RENAME LICENSE.yubihsm COMPONENT base)
+
+add_custom_target(base-install
+  COMMAND "${CMAKE_COMMAND}" --build "${CMAKE_BINARY_DIR}"
+  COMMAND "${CMAKE_COMMAND}" -DCMAKE_INSTALL_COMPONENT=base -P "${CMAKE_BINARY_DIR}/cmake_install.cmake"
+  USES_TERMINAL
+)
+
+get_property(_CTEST_CUSTOM_TESTS_IGNORE GLOBAL PROPERTY CTEST_CUSTOM_TESTS_IGNORE)
+file(WRITE "${CMAKE_BINARY_DIR}/CTestCustom.cmake" "SET(CTEST_CUSTOM_TESTS_IGNORE ${_CTEST_CUSTOM_TESTS_IGNORE})")
+
+include(package)
 include(doxygen)

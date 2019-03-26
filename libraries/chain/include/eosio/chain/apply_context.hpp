@@ -1,6 +1,6 @@
 /**
  *  @file
- *  @copyright defined in eos/LICENSE.txt
+ *  @copyright defined in eos/LICENSE
  */
 #pragma once
 #include <eosio/chain/controller.hpp>
@@ -62,7 +62,7 @@ class apply_context {
             const T& get( int iterator ) {
                EOS_ASSERT( iterator != -1, invalid_table_iterator, "invalid iterator" );
                EOS_ASSERT( iterator >= 0, table_operation_not_permitted, "dereference of end iterator" );
-               EOS_ASSERT( iterator < _iterator_to_object.size(), invalid_table_iterator, "iterator out of range" );
+               EOS_ASSERT( (size_t)iterator < _iterator_to_object.size(), invalid_table_iterator, "iterator out of range" );
                auto result = _iterator_to_object[iterator];
                EOS_ASSERT( result, table_operation_not_permitted, "dereference of deleted object" );
                return *result;
@@ -71,7 +71,8 @@ class apply_context {
             void remove( int iterator ) {
                EOS_ASSERT( iterator != -1, invalid_table_iterator, "invalid iterator" );
                EOS_ASSERT( iterator >= 0, table_operation_not_permitted, "cannot call remove on end iterators" );
-               EOS_ASSERT( iterator < _iterator_to_object.size(), invalid_table_iterator, "iterator out of range" );
+               EOS_ASSERT( (size_t)iterator < _iterator_to_object.size(), invalid_table_iterator, "iterator out of range" );
+
                auto obj_ptr = _iterator_to_object[iterator];
                if( !obj_ptr ) return;
                _iterator_to_object[iterator] = nullptr;
@@ -465,15 +466,14 @@ class apply_context {
       ,idx_double(*this)
       ,idx_long_double(*this)
       {
-         reset_console();
       }
 
 
    /// Execution methods:
    public:
 
-      action_trace exec_one();
-      void exec();
+      void exec_one( action_trace& trace );
+      void exec( action_trace& trace );
       void execute_inline( action&& a );
       void execute_context_free_inline( action&& a );
       void schedule_deferred_transaction( const uint128_t& sender_id, account_name payer, transaction&& trx, bool replace_existing );
@@ -516,23 +516,8 @@ class apply_context {
    /// Console methods:
    public:
 
-      void reset_console();
-      std::ostringstream& get_console_stream()            { return _pending_console_output; }
-      const std::ostringstream& get_console_stream()const { return _pending_console_output; }
-
-      template<typename T>
-      void console_append(T val) {
-         _pending_console_output << val;
-      }
-
-      template<typename T, typename ...Ts>
-      void console_append(T val, Ts ...rest) {
-         console_append(val);
-         console_append(rest...);
-      };
-
-      inline void console_append_formatted(const string& fmt, const variant_object& vo) {
-         console_append(fc::format_string(fmt, vo));
+      void console_append( const string& val ) {
+         _pending_console_output += val;
       }
 
    /// Database methods:
@@ -573,12 +558,7 @@ class apply_context {
       uint64_t next_auth_sequence( account_name actor );
 
       void add_ram_usage( account_name account, int64_t ram_delta );
-
-   private:
-
-      void validate_referenced_accounts( const transaction& t )const;
-      void validate_expiration( const transaction& t )const;
-
+      void finalize_trace( action_trace& trace, const fc::time_point& start );
 
    /// Fields:
    public:
@@ -600,15 +580,13 @@ class apply_context {
       generic_index<index_double_object>                             idx_double;
       generic_index<index_long_double_object>                        idx_long_double;
 
-      action_trace                                trace;
-
    private:
 
       iterator_cache<key_value_object>    keyval_cache;
       vector<account_name>                _notified; ///< keeps track of new accounts to be notifed of current message
       vector<action>                      _inline_actions; ///< queued inline messages
       vector<action>                      _cfa_inline_actions; ///< queued inline messages
-      std::ostringstream                  _pending_console_output;
+      std::string                         _pending_console_output;
       flat_set<account_delta>             _account_ram_deltas; ///< flat_set of account_delta so json is an array of objects
 
       //bytes                               _cached_trx;

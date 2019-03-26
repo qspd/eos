@@ -1,6 +1,6 @@
 /**
  *  @file
- *  @copyright defined in eos/LICENSE.txt
+ *  @copyright defined in eos/LICENSE
  */
 #pragma once
 #include <eosio/chain/name.hpp>
@@ -95,6 +95,40 @@ namespace eosio { namespace chain {
    using shared_vector = boost::interprocess::vector<T, allocator<T>>;
    template<typename T>
    using shared_set = boost::interprocess::set<T, std::less<T>, allocator<T>>;
+
+   /**
+    * For bugs in boost interprocess we moved our blob data to shared_string
+    * this wrapper allows us to continue that while also having a type-level distinction for
+    * serialization and to/from variant
+    */
+   class shared_blob : public shared_string {
+      public:
+         shared_blob() = delete;
+         shared_blob(shared_blob&&) = default;
+
+         shared_blob(const shared_blob& s)
+         :shared_string(s.get_allocator())
+         {
+            assign(s.c_str(), s.size());
+         }
+
+
+         shared_blob& operator=(const shared_blob& s) {
+            assign(s.c_str(), s.size());
+            return *this;
+         }
+
+         shared_blob& operator=(shared_blob&& ) = default;
+
+         template <typename InputIterator>
+         shared_blob(InputIterator f, InputIterator l, const allocator_type& a)
+         :shared_string(f,l,a)
+         {}
+
+         shared_blob(const allocator_type& a)
+         :shared_string(a)
+         {}
+   };
 
    using action_name      = name;
    using scope_name       = name;

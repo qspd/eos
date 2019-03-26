@@ -1,6 +1,6 @@
 /**
  *  @file
- *  @copyright defined in eos/LICENSE.txt
+ *  @copyright defined in eos/LICENSE
  *  @brief launch testnet nodes
  **/
 #include <string>
@@ -408,6 +408,7 @@ struct launcher_def {
    bool skip_transaction_signatures = false;
    string eosd_extra_args;
    std::map<uint,string> specific_nodeos_args;
+   std::map<uint,string> specific_nodeos_installation_paths;
    testnet_def network;
    string gelf_endpoint;
    vector <string> aliases;
@@ -426,6 +427,7 @@ struct launcher_def {
    string start_temp;
    string start_script;
    fc::optional<uint32_t> max_block_cpu_usage;
+   fc::optional<uint32_t> max_transaction_cpu_usage;
    eosio::chain::genesis_state genesis_from_file;
 
    void assign_name (eosd_def &node, bool is_bios);
@@ -487,8 +489,10 @@ launcher_def::set_options (bpo::options_description &cfg) {
     ("genesis,g",bpo::value<string>()->default_value("./genesis.json"),"set the path to genesis.json")
     ("skip-signature", bpo::bool_switch(&skip_transaction_signatures)->default_value(false), "nodeos does not require transaction signatures.")
     ("nodeos", bpo::value<string>(&eosd_extra_args), "forward nodeos command line argument(s) to each instance of nodeos, enclose arg(s) in quotes")
-    ("specific-num", bpo::value<vector<uint>>()->composing(), "forward nodeos command line argument(s) (using \"--specific-nodeos\" flag) to this specific instance of nodeos. This parameter can be entered multiple times and requires a paired \"--specific-nodeos\" flag")
+    ("specific-num", bpo::value<vector<uint>>()->composing(), "forward nodeos command line argument(s) (using \"--specific-nodeos\" flag) to this specific instance of nodeos. This parameter can be entered multiple times and requires a paired \"--specific-nodeos\" flag each time it is used")
     ("specific-nodeos", bpo::value<vector<string>>()->composing(), "forward nodeos command line argument(s) to its paired specific instance of nodeos(using \"--specific-num\"), enclose arg(s) in quotes")
+    ("spcfc-inst-num", bpo::value<vector<uint>>()->composing(), "Specify a specific version installation path (using \"--spcfc-inst-nodeos\" flag) for launching this specific instance of nodeos. This parameter can be entered multiple times and requires a paired \"--spcfc-inst-nodeos\" flag each time it is used")
+    ("spcfc-inst-nodeos", bpo::value<vector<string>>()->composing(), "Provide a specific version installation path to its paired specific instance of nodeos(using \"--spcfc-inst-num\")")
     ("delay,d",bpo::value<int>(&start_delay)->default_value(0),"seconds delay before starting each node after the first")
     ("boot",bpo::bool_switch(&boot)->default_value(false),"After deploying the nodes and generating a boot script, invoke it.")
     ("nogen",bpo::bool_switch(&nogen)->default_value(false),"launch nodes without writing new config files")
@@ -500,7 +504,8 @@ launcher_def::set_options (bpo::options_description &cfg) {
     ("gelf-endpoint",bpo::value<string>(&gelf_endpoint)->default_value("10.160.11.21:12201"),"hostname:port or ip:port of GELF endpoint")
     ("template",bpo::value<string>(&start_temp)->default_value("testnet.template"),"the startup script template")
     ("script",bpo::value<string>(&start_script)->default_value("bios_boot.sh"),"the generated startup script name")
-    ("max-block-cpu-usage",bpo::value<uint32_t>(),"")
+    ("max-block-cpu-usage",bpo::value<uint32_t>(),"Provide the \"max-block-cpu-usage\" value to use in the genesis.json file")
+    ("max-transaction-cpu-usage",bpo::value<uint32_t>(),"Provide the \"max-transaction-cpu-usage\" value to use in the genesis.json file")
         ;
 }
 
@@ -509,6 +514,28 @@ inline enum_type& operator|=(enum_type&lhs, const enum_type& rhs)
 {
   using T = std::underlying_type_t <enum_type>;
   return lhs = static_cast<enum_type>(static_cast<T>(lhs) | static_cast<T>(rhs));
+}
+
+template <typename T>
+void retrieve_paired_array_parameters (const variables_map &vmap, const std::string& num_selector, const std::string& paired_selector, std::map<uint,T>& selector_map) {
+   if (vmap.count(num_selector)) {
+     const auto specific_nums = vmap[num_selector].as<vector<uint>>();
+     const auto specific_args = vmap[paired_selector].as<vector<string>>();
+     if (specific_nums.size() != specific_args.size()) {
+       cerr << "ERROR: every " << num_selector << " argument must be paired with a " << paired_selector << " argument" << endl;
+       exit (-1);
+     }
+     const auto total_nodes = vmap["nodes"].as<size_t>();
+     for(uint i = 0; i < specific_nums.size(); ++i)
+     {
+       const auto& num = specific_nums[i];
+       if (num >= total_nodes) {
+         cerr << "\"--" << num_selector << "\" provided value= " << num << " is higher than \"--nodes\" provided value=" << total_nodes << endl;
+         exit (-1);
+       }
+       selector_map[num] = specific_args[i];
+     }
+   }
 }
 
 void
@@ -536,6 +563,10 @@ launcher_def::initialize (const variables_map &vmap) {
      max_block_cpu_usage = vmap["max-block-cpu-usage"].as<uint32_t>();
   }
 
+  if (vmap.count("max-transaction-cpu-usage")) {
+     max_transaction_cpu_usage = vmap["max-transaction-cpu-usage"].as<uint32_t>();
+  }
+
   genesis = vmap["genesis"].as<string>();
   if (vmap.count("host-map")) {
      host_map_file = vmap["host-map"].as<string>();
@@ -544,24 +575,8 @@ launcher_def::initialize (const variables_map &vmap) {
      server_ident_file = vmap["servers"].as<string>();
   }
 
-  if (vmap.count("specific-num")) {
-    const auto specific_nums = vmap["specific-num"].as<vector<uint>>();
-    const auto specific_args = vmap["specific-nodeos"].as<vector<string>>();
-    if (specific_nums.size() != specific_args.size()) {
-      cerr << "ERROR: every specific-num argument must be paired with a specific-nodeos argument" << endl;
-      exit (-1);
-    }
-    const auto total_nodes = vmap["nodes"].as<size_t>();
-    for(uint i = 0; i < specific_nums.size(); ++i)
-    {
-      const auto& num = specific_nums[i];
-      if (num >= total_nodes) {
-        cerr << "\"--specific-num\" provided value= " << num << " is higher than \"--nodes\" provided value=" << total_nodes << endl;
-        exit (-1);
-      }
-      specific_nodeos_args[num] = specific_args[i];
-    }
-  }
+  retrieve_paired_array_parameters(vmap, "specific-num", "specific-nodeos", specific_nodeos_args);
+  retrieve_paired_array_parameters(vmap, "spcfc-inst-num", "spcfc-inst-nodeos", specific_nodeos_installation_paths);
 
   using namespace std::chrono;
   system_clock::time_point now = system_clock::now();
@@ -844,7 +859,7 @@ launcher_def::bind_nodes () {
       cerr << "Unable to allocate producers due to insufficient prod_nodes = " << prod_nodes << "\n";
       exit (10);
    }
-   int non_bios = prod_nodes - 1;
+   size_t non_bios = prod_nodes - 1;
    int per_node = producers / non_bios;
    int extra = producers % non_bios;
    unsigned int i = 0;
@@ -1184,6 +1199,8 @@ launcher_def::init_genesis () {
    genesis_from_file.initial_key = public_key_type(bioskey);
    if (max_block_cpu_usage)
       genesis_from_file.initial_configuration.max_block_cpu_usage = *max_block_cpu_usage;
+   if (max_transaction_cpu_usage)
+      genesis_from_file.initial_configuration.max_transaction_cpu_usage = *max_transaction_cpu_usage;
 }
 
 void
@@ -1503,7 +1520,14 @@ launcher_def::launch (eosd_def &instance, string &gts) {
   node_rt_info info;
   info.remote = !host->is_local();
 
-  string eosdcmd = "programs/nodeos/nodeos ";
+  string install_path;
+  if (instance.name != "bios" && !specific_nodeos_installation_paths.empty()) {
+     const auto node_num = boost::lexical_cast<uint16_t,string>(instance.get_node_num());
+     if (specific_nodeos_installation_paths.count(node_num)) {
+        install_path = specific_nodeos_installation_paths[node_num] + "/";
+     }
+  }
+  string eosdcmd = install_path + "programs/nodeos/nodeos ";
   if (skip_transaction_signatures) {
     eosdcmd += "--skip-transaction-signatures ";
   }
@@ -1998,7 +2022,7 @@ int main (int argc, char *argv[]) {
 
 
 //-------------------------------------------------------------
-
+// @ignore local_config_file
 FC_REFLECT( remote_deploy,
             (ssh_cmd)(scp_cmd)(ssh_identity)(ssh_args) )
 
@@ -2008,16 +2032,20 @@ FC_REFLECT( prodkey_def,
 FC_REFLECT( producer_set_def,
             (schedule))
 
+// @ignore listen_addr, p2p_count, http_count, dot_label_str
 FC_REFLECT( host_def,
             (genesis)(ssh_identity)(ssh_args)(eosio_home)
             (host_name)(public_name)
             (base_p2p_port)(base_http_port)(def_file_size)
             (instances) )
 
+// @ignore node, dot_label_str
 FC_REFLECT( eosd_def,
-            (name)(config_dir_name)(data_dir_name)(has_db)
-            (p2p_port)(http_port)(file_size) )
+            (config_dir_name)(data_dir_name)(p2p_port)
+            (http_port)(file_size)(has_db)(name)(host)
+            (p2p_endpoint) )
 
+// @ignore instance, gelf_endpoint
 FC_REFLECT( tn_node_def, (name)(keys)(peers)(producers) )
 
 FC_REFLECT( testnet_def, (name)(ssh_helper)(nodes) )

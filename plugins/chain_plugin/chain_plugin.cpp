@@ -1,6 +1,6 @@
 /**
  *  @file
- *  @copyright defined in eos/LICENSE.txt
+ *  @copyright defined in eos/LICENSE
  */
 #include <eosio/chain_plugin/chain_plugin.hpp>
 #include <eosio/chain/fork_database.hpp>
@@ -14,12 +14,9 @@
 #include <eosio/chain/reversible_block_object.hpp>
 #include <eosio/chain/controller.hpp>
 #include <eosio/chain/generated_transaction_object.hpp>
+#include <eosio/chain/snapshot.hpp>
 
 #include <eosio/chain/eosio_contract.hpp>
-
-#include <eosio/utilities/key_conversion.hpp>
-#include <eosio/utilities/common.hpp>
-#include <eosio/chain/wast_to_wasm.hpp>
 
 #include <boost/signals2/connection.hpp>
 #include <boost/algorithm/string.hpp>
@@ -28,6 +25,7 @@
 #include <fc/io/json.hpp>
 #include <fc/variant.hpp>
 #include <signal.h>
+#include <cstdlib>
 
 namespace eosio {
 
@@ -148,7 +146,6 @@ public:
    ,irreversible_block_channel(app().get_channel<channels::irreversible_block>())
    ,accepted_transaction_channel(app().get_channel<channels::accepted_transaction>())
    ,applied_transaction_channel(app().get_channel<channels::applied_transaction>())
-   ,accepted_confirmation_channel(app().get_channel<channels::accepted_confirmation>())
    ,incoming_block_channel(app().get_channel<incoming::channels::block>())
    ,incoming_block_sync_method(app().get_method<incoming::methods::block_sync>())
    ,incoming_transaction_async_method(app().get_method<incoming::methods::transaction_async>())
@@ -166,6 +163,7 @@ public:
    //txn_msg_rate_limits              rate_limits;
    fc::optional<vm_type>            wasm_runtime;
    fc::microseconds                 abi_serializer_max_time_ms;
+   fc::optional<bfs::path>          snapshot_path;
 
 
    // retained references to channels for easy publication
@@ -175,7 +173,6 @@ public:
    channels::irreversible_block::channel_type&     irreversible_block_channel;
    channels::accepted_transaction::channel_type&   accepted_transaction_channel;
    channels::applied_transaction::channel_type&    applied_transaction_channel;
-   channels::accepted_confirmation::channel_type&  accepted_confirmation_channel;
    incoming::channels::block::channel_type&         incoming_block_channel;
 
    // retained references to methods for easy calling
@@ -195,13 +192,14 @@ public:
    fc::optional<scoped_connection>                                   irreversible_block_connection;
    fc::optional<scoped_connection>                                   accepted_transaction_connection;
    fc::optional<scoped_connection>                                   applied_transaction_connection;
-   fc::optional<scoped_connection>                                   accepted_confirmation_connection;
-
 
 };
 
 chain_plugin::chain_plugin()
 :my(new chain_plugin_impl()) {
+   app().register_config_type<eosio::chain::db_read_mode>();
+   app().register_config_type<eosio::chain::validation_mode>();
+   app().register_config_type<chainbase::pinnable_mapped_file::map_mode>();
 }
 
 chain_plugin::~chain_plugin(){}
@@ -219,6 +217,10 @@ void chain_plugin::set_program_options(options_description& cli, options_descrip
          ("chain-state-db-guard-size-mb", bpo::value<uint64_t>()->default_value(config::default_state_guard_size / (1024  * 1024)), "Safely shut down node when free space remaining in the chain state database drops below this size (in MiB).")
          ("reversible-blocks-db-size-mb", bpo::value<uint64_t>()->default_value(config::default_reversible_cache_size / (1024  * 1024)), "Maximum size (in MiB) of the reversible blocks database")
          ("reversible-blocks-db-guard-size-mb", bpo::value<uint64_t>()->default_value(config::default_reversible_guard_size / (1024  * 1024)), "Safely shut down node when free space remaining in the reverseible blocks database drops below this size (in MiB).")
+         ("signature-cpu-billable-pct", bpo::value<uint32_t>()->default_value(config::default_sig_cpu_bill_pct / config::percent_1),
+          "Percentage of actual signature recovery cpu to bill. Whole number percentages, e.g. 50 for 50%")
+         ("chain-threads", bpo::value<uint16_t>()->default_value(config::default_controller_thread_pool_size),
+          "Number of worker threads in controller thread pool")
          ("contracts-console", bpo::bool_switch()->default_value(false),
           "print contract's output to console")
          ("actor-whitelist", boost::program_options::value<vector<string>>()->composing()->multitoken(),
@@ -233,6 +235,8 @@ void chain_plugin::set_program_options(options_description& cli, options_descrip
           "Action (in the form code::action) added to action blacklist (may specify multiple times)")
          ("key-blacklist", boost::program_options::value<vector<string>>()->composing()->multitoken(),
           "Public key added to blacklist of keys that should not be included in authorities (may specify multiple times)")
+         ("sender-bypass-whiteblacklist", boost::program_options::value<vector<string>>()->composing()->multitoken(),
+          "Deferred transactions sent by accounts in this list do not have any of the subjective whitelist/blacklist checks applied to them (may specify multiple times)")
          ("read-mode", boost::program_options::value<eosio::chain::db_read_mode>()->default_value(eosio::chain::db_read_mode::SPECULATIVE),
           "Database read mode (\"speculative\", \"head\", or \"read-only\").\n"// or \"irreversible\").\n"
           "In \"speculative\" mode database contains changes done up to the head block plus changes made by transactions not yet included to the blockchain.\n"
@@ -246,6 +250,20 @@ void chain_plugin::set_program_options(options_description& cli, options_descrip
           "In \"light\" mode all incoming blocks headers will be fully validated; transactions in those validated blocks will be trusted \n")
          ("disable-ram-billing-notify-checks", bpo::bool_switch()->default_value(false),
           "Disable the check which subjectively fails a transaction if a contract bills more RAM to another account within the context of a notification handler (i.e. when the receiver is not the code of the action).")
+         ("trusted-producer", bpo::value<vector<string>>()->composing(), "Indicate a producer whose blocks headers signed by it will be fully validated, but transactions in those validated blocks will be trusted.")
+         ("database-map-mode", bpo::value<chainbase::pinnable_mapped_file::map_mode>()->default_value(chainbase::pinnable_mapped_file::map_mode::mapped),
+          "Database map mode (\"mapped\", \"heap\", or \"locked\").\n"
+          "In \"mapped\" mode database is memory mapped as a file.\n"
+          "In \"heap\" mode database is preloaded in to swappable memory.\n"
+#ifdef __linux__
+          "In \"locked\" mode database is preloaded, locked in to memory, and optionally can use huge pages.\n"
+#else
+          "In \"locked\" mode database is preloaded and locked in to memory.\n"
+#endif
+         )
+#ifdef __linux__
+         ("database-hugepage-path", bpo::value<vector<string>>()->composing(), "Optional path for database hugepages when in \"locked\" mode (may specify multiple times)")
+#endif
          ;
 
 // TODO: rate limiting
@@ -283,7 +301,7 @@ void chain_plugin::set_program_options(options_description& cli, options_descrip
           "replace reversible block database with blocks imported from specified file and then exit")
          ("export-reversible-blocks", bpo::value<bfs::path>(),
            "export reversible block database in portable format into specified file and then exit")
-         ("trusted-producer", bpo::value<vector<string>>()->composing(), "Indicate a producer whose blocks headers signed by it will be fully validated, but transactions in those validated blocks will be trusted.")
+         ("snapshot", bpo::value<bfs::path>(), "File to read Snapshot State from")
          ;
 
 }
@@ -339,6 +357,7 @@ void chain_plugin::plugin_initialize(const variables_map& options) {
 
       my->chain_config = controller::config();
 
+      LOAD_VALUE_SET( options, "sender-bypass-whiteblacklist", my->chain_config->sender_bypass_whiteblacklist );
       LOAD_VALUE_SET( options, "actor-whitelist", my->chain_config->actor_whitelist );
       LOAD_VALUE_SET( options, "actor-blacklist", my->chain_config->actor_blacklist );
       LOAD_VALUE_SET( options, "contract-whitelist", my->chain_config->contract_whitelist );
@@ -415,6 +434,17 @@ void chain_plugin::plugin_initialize(const variables_map& options) {
       if( options.count( "reversible-blocks-db-guard-size-mb" ))
          my->chain_config->reversible_guard_size = options.at( "reversible-blocks-db-guard-size-mb" ).as<uint64_t>() * 1024 * 1024;
 
+      if( options.count( "chain-threads" )) {
+         my->chain_config->thread_pool_size = options.at( "chain-threads" ).as<uint16_t>();
+         EOS_ASSERT( my->chain_config->thread_pool_size > 0, plugin_config_exception,
+                     "chain-threads ${num} must be greater than 0", ("num", my->chain_config->thread_pool_size) );
+      }
+
+      my->chain_config->sig_cpu_bill_pct = options.at("signature-cpu-billable-pct").as<uint32_t>();
+      EOS_ASSERT( my->chain_config->sig_cpu_bill_pct >= 0 && my->chain_config->sig_cpu_bill_pct <= 100, plugin_config_exception,
+                  "signature-cpu-billable-pct must be 0 - 100, ${pct}", ("pct", my->chain_config->sig_cpu_bill_pct) );
+      my->chain_config->sig_cpu_bill_pct *= config::percent_1;
+
       if( my->wasm_runtime )
          my->chain_config->wasm_runtime = *my->wasm_runtime;
 
@@ -488,8 +518,6 @@ void chain_plugin::plugin_initialize(const variables_map& options) {
                          my->chain_config->blocks_dir / config::reversible_blocks_dir_name );
                fc::copy( backup_dir / config::reversible_blocks_dir_name / "shared_memory.bin",
                          my->chain_config->blocks_dir / config::reversible_blocks_dir_name / "shared_memory.bin" );
-               fc::copy( backup_dir / config::reversible_blocks_dir_name / "shared_memory.meta",
-                         my->chain_config->blocks_dir / config::reversible_blocks_dir_name / "shared_memory.meta" );
             }
          }
       } else if( options.at( "replay-blockchain" ).as<bool>()) {
@@ -530,44 +558,100 @@ void chain_plugin::plugin_initialize(const variables_map& options) {
          wlog("The --import-reversible-blocks option should be used by itself.");
       }
 
-      if( options.count( "genesis-json" )) {
-         EOS_ASSERT( !fc::exists( my->blocks_dir / "blocks.log" ),
-                     plugin_config_exception,
-                    "Genesis state can only be set on a fresh blockchain." );
+      if (options.count( "snapshot" )) {
+         my->snapshot_path = options.at( "snapshot" ).as<bfs::path>();
+         EOS_ASSERT( fc::exists(*my->snapshot_path), plugin_config_exception,
+                     "Cannot load snapshot, ${name} does not exist", ("name", my->snapshot_path->generic_string()) );
 
-         auto genesis_file = options.at( "genesis-json" ).as<bfs::path>();
-         if( genesis_file.is_relative()) {
-            genesis_file = bfs::current_path() / genesis_file;
+         // recover genesis information from the snapshot
+         auto infile = std::ifstream(my->snapshot_path->generic_string(), (std::ios::in | std::ios::binary));
+         auto reader = std::make_shared<istream_snapshot_reader>(infile);
+         reader->validate();
+         reader->read_section<genesis_state>([this]( auto &section ){
+            section.read_row(my->chain_config->genesis);
+         });
+         infile.close();
+
+         EOS_ASSERT( options.count( "genesis-timestamp" ) == 0,
+                 plugin_config_exception,
+                 "--snapshot is incompatible with --genesis-timestamp as the snapshot contains genesis information");
+
+         if( options.count( "genesis-json" )) {
+            auto genesis_path = options.at( "genesis-json" ).as<bfs::path>();
+            if( genesis_path.is_relative() ) {
+               genesis_path = bfs::current_path() / genesis_path;
+            }
+            EOS_ASSERT( fc::is_regular_file( genesis_path ),
+                        plugin_config_exception,
+                        "Specified genesis file '${genesis}' does not exist.",
+                        ("genesis", genesis_path.generic_string()));
+            auto genesis_file = fc::json::from_file( genesis_path ).as<genesis_state>();
+            EOS_ASSERT( my->chain_config->genesis == genesis_file, plugin_config_exception,
+                        "Genesis state provided via command line arguments does not match the existing genesis state in the snapshot. "
+                        "It is not necessary to provide a genesis state argument when loading a snapshot."
+                      );
+         }
+         auto shared_mem_path = my->chain_config->state_dir / "shared_memory.bin";
+         EOS_ASSERT( !fc::exists(shared_mem_path),
+                 plugin_config_exception,
+                 "Snapshot can only be used to initialize an empty database." );
+
+         if( fc::is_regular_file( my->blocks_dir / "blocks.log" )) {
+            auto log_genesis = block_log::extract_genesis_state(my->blocks_dir);
+            EOS_ASSERT( log_genesis.compute_chain_id() == my->chain_config->genesis.compute_chain_id(),
+                    plugin_config_exception,
+                    "Genesis information in blocks.log does not match genesis information in the snapshot");
          }
 
-         EOS_ASSERT( fc::is_regular_file( genesis_file ),
-                     plugin_config_exception,
-                    "Specified genesis file '${genesis}' does not exist.",
-                    ("genesis", genesis_file.generic_string()));
-
-         my->chain_config->genesis = fc::json::from_file( genesis_file ).as<genesis_state>();
-
-         ilog( "Using genesis state provided in '${genesis}'", ("genesis", genesis_file.generic_string()));
-
-         if( options.count( "genesis-timestamp" )) {
-            my->chain_config->genesis.initial_timestamp = calculate_genesis_timestamp(
-                  options.at( "genesis-timestamp" ).as<string>());
-         }
-
-         wlog( "Starting up fresh blockchain with provided genesis state." );
-      } else if( options.count( "genesis-timestamp" )) {
-         EOS_ASSERT( !fc::exists( my->blocks_dir / "blocks.log" ),
-                     plugin_config_exception,
-                    "Genesis state can only be set on a fresh blockchain." );
-
-         my->chain_config->genesis.initial_timestamp = calculate_genesis_timestamp(
-               options.at( "genesis-timestamp" ).as<string>());
-
-         wlog( "Starting up fresh blockchain with default genesis state but with adjusted genesis timestamp." );
-      } else if( fc::is_regular_file( my->blocks_dir / "blocks.log" )) {
-         my->chain_config->genesis = block_log::extract_genesis_state( my->blocks_dir );
       } else {
-         wlog( "Starting up fresh blockchain with default genesis state." );
+         bfs::path genesis_file;
+         bool genesis_timestamp_specified = false;
+         fc::optional<genesis_state> existing_genesis;
+
+         if( fc::exists( my->blocks_dir / "blocks.log" ) ) {
+            my->chain_config->genesis = block_log::extract_genesis_state( my->blocks_dir );
+            existing_genesis = my->chain_config->genesis;
+         }
+
+         if( options.count( "genesis-json" )) {
+            genesis_file = options.at( "genesis-json" ).as<bfs::path>();
+            if( genesis_file.is_relative()) {
+               genesis_file = bfs::current_path() / genesis_file;
+            }
+
+            EOS_ASSERT( fc::is_regular_file( genesis_file ),
+                        plugin_config_exception,
+                       "Specified genesis file '${genesis}' does not exist.",
+                       ("genesis", genesis_file.generic_string()));
+
+            my->chain_config->genesis = fc::json::from_file( genesis_file ).as<genesis_state>();
+         }
+
+         if( options.count( "genesis-timestamp" ) ) {
+            my->chain_config->genesis.initial_timestamp = calculate_genesis_timestamp( options.at( "genesis-timestamp" ).as<string>() );
+            genesis_timestamp_specified = true;
+         }
+
+         if( !existing_genesis ) {
+            if( !genesis_file.empty() ) {
+               if( genesis_timestamp_specified ) {
+                  ilog( "Using genesis state provided in '${genesis}' but with adjusted genesis timestamp",
+                        ("genesis", genesis_file.generic_string()) );
+               } else {
+                  ilog( "Using genesis state provided in '${genesis}'", ("genesis", genesis_file.generic_string()));
+               }
+               wlog( "Starting up fresh blockchain with provided genesis state." );
+            } else if( genesis_timestamp_specified ) {
+               wlog( "Starting up fresh blockchain with default genesis state but with adjusted genesis timestamp." );
+            } else {
+               wlog( "Starting up fresh blockchain with default genesis state." );
+            }
+         } else {
+            EOS_ASSERT( my->chain_config->genesis == *existing_genesis, plugin_config_exception,
+                        "Genesis state provided via command line arguments does not match the existing genesis state in blocks.log. "
+                        "It is not necessary to provide genesis state arguments when a blocks.log file already exists."
+                      );
+         }
       }
 
       if ( options.count("read-mode") ) {
@@ -578,6 +662,12 @@ void chain_plugin::plugin_initialize(const variables_map& options) {
       if ( options.count("validation-mode") ) {
          my->chain_config->block_validation_mode = options.at("validation-mode").as<validation_mode>();
       }
+
+      my->chain_config->db_map_mode = options.at("database-map-mode").as<pinnable_mapped_file::map_mode>();
+#ifdef __linux__
+      if( options.count("database-hugepage-path") )
+         my->chain_config->db_hugepage_paths = options.at("database-hugepage-path").as<std::vector<std::string>>();
+#endif
 
       my->chain.emplace( *my->chain_config );
       my->chain_id.emplace( my->chain->get_chain_id());
@@ -613,35 +703,30 @@ void chain_plugin::plugin_initialize(const variables_map& options) {
             );
          }
 
-         my->pre_accepted_block_channel.publish(blk);
+         my->pre_accepted_block_channel.publish(priority::medium, blk);
       });
 
       my->accepted_block_header_connection = my->chain->accepted_block_header.connect(
             [this]( const block_state_ptr& blk ) {
-               my->accepted_block_header_channel.publish( blk );
+               my->accepted_block_header_channel.publish( priority::medium, blk );
             } );
 
       my->accepted_block_connection = my->chain->accepted_block.connect( [this]( const block_state_ptr& blk ) {
-         my->accepted_block_channel.publish( blk );
+         my->accepted_block_channel.publish( priority::high, blk );
       } );
 
       my->irreversible_block_connection = my->chain->irreversible_block.connect( [this]( const block_state_ptr& blk ) {
-         my->irreversible_block_channel.publish( blk );
+         my->irreversible_block_channel.publish( priority::low, blk );
       } );
 
       my->accepted_transaction_connection = my->chain->accepted_transaction.connect(
             [this]( const transaction_metadata_ptr& meta ) {
-               my->accepted_transaction_channel.publish( meta );
+               my->accepted_transaction_channel.publish( priority::low, meta );
             } );
 
       my->applied_transaction_connection = my->chain->applied_transaction.connect(
             [this]( const transaction_trace_ptr& trace ) {
-               my->applied_transaction_channel.publish( trace );
-            } );
-
-      my->accepted_confirmation_connection = my->chain->accepted_confirmation.connect(
-            [this]( const header_confirmation& conf ) {
-               my->accepted_confirmation_channel.publish( conf );
+               my->applied_transaction_channel.publish( priority::low, trace );
             } );
 
       my->chain->add_indices();
@@ -652,7 +737,15 @@ void chain_plugin::plugin_initialize(const variables_map& options) {
 void chain_plugin::plugin_startup()
 { try {
    try {
-      my->chain->startup();
+      auto shutdown = [](){ return app().is_quiting(); };
+      if (my->snapshot_path) {
+         auto infile = std::ifstream(my->snapshot_path->generic_string(), (std::ios::in | std::ios::binary));
+         auto reader = std::make_shared<istream_snapshot_reader>(infile);
+         my->chain->startup(shutdown, reader);
+         infile.close();
+      } else {
+         my->chain->startup(shutdown);
+      }
    } catch (const database_guard_exception& e) {
       log_guard_exception(e);
       // make sure to properly close the db
@@ -677,7 +770,8 @@ void chain_plugin::plugin_shutdown() {
    my->irreversible_block_connection.reset();
    my->accepted_transaction_connection.reset();
    my->applied_transaction_connection.reset();
-   my->accepted_confirmation_connection.reset();
+   my->chain->get_thread_pool().stop();
+   my->chain->get_thread_pool().join();
    my->chain.reset();
 }
 
@@ -691,16 +785,16 @@ void chain_apis::read_write::validate() const {
    EOS_ASSERT( db.get_read_mode() != chain::db_read_mode::READ_ONLY, missing_chain_api_plugin_exception, "Not allowed, node in read-only mode" );
 }
 
-chain_apis::read_write chain_plugin::get_read_write_api() {
-   return chain_apis::read_write(chain(), get_abi_serializer_max_time());
-}
-
 void chain_plugin::accept_block(const signed_block_ptr& block ) {
    my->incoming_block_sync_method(block);
 }
 
 void chain_plugin::accept_transaction(const chain::packed_transaction& trx, next_function<chain::transaction_trace_ptr> next) {
-   my->incoming_transaction_async_method(std::make_shared<packed_transaction>(trx), false, std::forward<decltype(next)>(next));
+   my->incoming_transaction_async_method(std::make_shared<transaction_metadata>(std::make_shared<packed_transaction>(trx)), false, std::forward<decltype(next)>(next));
+}
+
+void chain_plugin::accept_transaction(const chain::transaction_metadata_ptr& trx, next_function<chain::transaction_trace_ptr> next) {
+   my->incoming_transaction_async_method(trx, false, std::forward<decltype(next)>(next));
 }
 
 bool chain_plugin::block_is_on_preferred_chain(const block_id_type& block_id) {
@@ -821,7 +915,7 @@ bool chain_plugin::import_reversible_blocks( const fc::path& reversible_dir,
    reversible_blocks.open( reversible_blocks_file.generic_string().c_str(), std::ios::in | std::ios::binary );
 
    reversible_blocks.seekg( 0, std::ios::end );
-   uint64_t end_pos = reversible_blocks.tellg();
+   auto end_pos = reversible_blocks.tellg();
    reversible_blocks.seekg( 0 );
 
    uint32_t num = 0;
@@ -845,7 +939,7 @@ bool chain_plugin::import_reversible_blocks( const fc::path& reversible_dir,
 
          new_reversible.create<reversible_block_object>( [&]( auto& ubo ) {
             ubo.blocknum = num;
-            ubo.set_block( std::make_shared<signed_block>(tmp) );
+            ubo.set_block( std::make_shared<signed_block>(std::move(tmp)) );
          });
          end = num;
       }
@@ -939,14 +1033,29 @@ void chain_plugin::handle_guard_exception(const chain::guard_exception& e) const
    app().quit();
 }
 
+void chain_plugin::handle_db_exhaustion() {
+   elog("database memory exhausted: increase chain-state-db-size-mb and/or reversible-blocks-db-size-mb");
+   //return 1 -- it's what programs/nodeos/main.cpp considers "BAD_ALLOC"
+   std::_Exit(1);
+}
+
 namespace chain_apis {
 
 const string read_only::KEYi64 = "i64";
 
+template<typename I>
+std::string itoh(I n, size_t hlen = sizeof(I)<<1) {
+   static const char* digits = "0123456789abcdef";
+   std::string r(hlen, '0');
+   for(size_t i = 0, j = (hlen - 1) * 4 ; i < hlen; ++i, j -= 4)
+      r[i] = digits[(n>>j) & 0x0f];
+   return r;
+}
+
 read_only::get_info_results read_only::get_info(const read_only::get_info_params&) const {
    const auto& rm = db.get_resource_limits_manager();
    return {
-      eosio::utilities::common::itoh(static_cast<uint32_t>(app().version())),
+      itoh(static_cast<uint32_t>(app().version())),
       db.get_chain_id(),
       db.fork_db_head_block_num(),
       db.last_irreversible_block_num(),
@@ -1011,31 +1120,45 @@ uint64_t read_only::get_table_index_name(const read_only::get_table_rows_params&
 
 template<>
 uint64_t convert_to_type(const string& str, const string& desc) {
-   uint64_t value = 0;
+
    try {
-      value = boost::lexical_cast<uint64_t>(str.c_str(), str.size());
-   } catch( ... ) {
+      return boost::lexical_cast<uint64_t>(str.c_str(), str.size());
+   } catch( ... ) { }
+
+   try {
+      auto trimmed_str = str;
+      boost::trim(trimmed_str);
+      name s(trimmed_str);
+      return s.value;
+   } catch( ... ) { }
+
+   if (str.find(',') != string::npos) { // fix #6274 only match formats like 4,EOS
       try {
-         auto trimmed_str = str;
-         boost::trim(trimmed_str);
-         name s(trimmed_str);
-         value = s.value;
-      } catch( ... ) {
-         try {
-            auto symb = eosio::chain::symbol::from_string(str);
-            value = symb.value();
-         } catch( ... ) {
-            try {
-               value = ( eosio::chain::string_to_symbol( 0, str.c_str() ) >> 8 );
-            } catch( ... ) {
-               EOS_ASSERT( false, chain_type_exception, "Could not convert ${desc} string '${str}' to any of the following: "
-                                 "uint64_t, valid name, or valid symbol (with or without the precision)",
-                          ("desc", desc)("str", str));
-            }
-         }
-      }
+         auto symb = eosio::chain::symbol::from_string(str);
+         return symb.value();
+      } catch( ... ) { }
    }
-   return value;
+
+   try {
+      return ( eosio::chain::string_to_symbol( 0, str.c_str() ) >> 8 );
+   } catch( ... ) {
+      EOS_ASSERT( false, chain_type_exception, "Could not convert ${desc} string '${str}' to any of the following: "
+                        "uint64_t, valid name, or valid symbol (with or without the precision)",
+                  ("desc", desc)("str", str));
+   }
+}
+
+template<>
+double convert_to_type(const string& str, const string& desc) {
+   double val{};
+   try {
+      val = fc::variant(str).as<double>();
+   } FC_RETHROW_EXCEPTIONS(warn, "Could not convert ${desc} string '${str}' to key type.", ("desc", desc)("str",str) )
+
+   EOS_ASSERT( !std::isnan(val), chain::contract_table_query_exception,
+               "Converted ${desc} string '${str}' to NaN which is not a permitted value for the key type", ("desc", desc)("str",str) );
+
+   return val;
 }
 
 abi_def get_abi( const controller& db, const name& account ) {
@@ -1058,7 +1181,8 @@ string get_table_type( const abi_def& abi, const name& table_name ) {
 
 read_only::get_table_rows_result read_only::get_table_rows( const read_only::get_table_rows_params& p )const {
    const abi_def abi = eosio::chain_apis::get_abi( db, p.code );
-
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstrict-aliasing"
    bool primary = false;
    auto table_with_index = get_table_index_name( p, primary );
    if( primary ) {
@@ -1113,54 +1237,61 @@ read_only::get_table_rows_result read_only::get_table_rows( const read_only::get
       }
       EOS_ASSERT(false, chain::contract_table_query_exception,  "Unsupported secondary index type: ${t}", ("t", p.key_type));
    }
+#pragma GCC diagnostic pop
 }
 
 read_only::get_table_by_scope_result read_only::get_table_by_scope( const read_only::get_table_by_scope_params& p )const {
-   const auto& d = db.db();
-   const auto& idx = d.get_index<chain::table_id_multi_index, chain::by_code_scope_table>();
-   decltype(idx.lower_bound(boost::make_tuple(0, 0, 0))) lower;
-   decltype(idx.upper_bound(boost::make_tuple(0, 0, 0))) upper;
-
-   if (p.lower_bound.size()) {
-      uint64_t scope = convert_to_type<uint64_t>(p.lower_bound, "lower_bound scope");
-      lower = idx.lower_bound( boost::make_tuple(p.code, scope, p.table));
-   } else {
-      lower = idx.lower_bound(boost::make_tuple(p.code, 0, p.table));
-   }
-   if (p.upper_bound.size()) {
-      uint64_t scope = convert_to_type<uint64_t>(p.upper_bound, "upper_bound scope");
-      upper = idx.lower_bound( boost::make_tuple(p.code, scope, 0));
-   } else {
-      upper = idx.lower_bound(boost::make_tuple((uint64_t)p.code + 1, 0, 0));
-   }
-
-   auto end = fc::time_point::now() + fc::microseconds(1000 * 10); /// 10ms max time
-   unsigned int count = 0;
-   auto itr = lower;
    read_only::get_table_by_scope_result result;
-   for (; itr != upper; ++itr) {
-      if (p.table && itr->table != p.table) {
-         if (fc::time_point::now() > end) {
-            break;
-         }
-         continue;
-      }
-      result.rows.push_back({itr->code, itr->scope, itr->table, itr->payer, itr->count});
-      if (++count == p.limit || fc::time_point::now() > end) {
-         ++itr;
-         break;
-      }
+   const auto& d = db.db();
+
+   const auto& idx = d.get_index<chain::table_id_multi_index, chain::by_code_scope_table>();
+   auto lower_bound_lookup_tuple = std::make_tuple( p.code.value, std::numeric_limits<uint64_t>::lowest(), p.table.value );
+   auto upper_bound_lookup_tuple = std::make_tuple( p.code.value, std::numeric_limits<uint64_t>::max(),
+                                                    (p.table.empty() ? std::numeric_limits<uint64_t>::max() : p.table.value) );
+
+   if( p.lower_bound.size() ) {
+      uint64_t scope = convert_to_type<uint64_t>(p.lower_bound, "lower_bound scope");
+      std::get<1>(lower_bound_lookup_tuple) = scope;
    }
-   if (itr != upper) {
-      result.more = (string)itr->scope;
+
+   if( p.upper_bound.size() ) {
+      uint64_t scope = convert_to_type<uint64_t>(p.upper_bound, "upper_bound scope");
+      std::get<1>(upper_bound_lookup_tuple) = scope;
    }
+
+   if( upper_bound_lookup_tuple < lower_bound_lookup_tuple )
+      return result;
+
+   auto walk_table_range = [&]( auto itr, auto end_itr ) {
+      auto cur_time = fc::time_point::now();
+      auto end_time = cur_time + fc::microseconds(1000 * 10); /// 10ms max time
+      for( unsigned int count = 0; cur_time <= end_time && count < p.limit && itr != end_itr; ++itr, cur_time = fc::time_point::now() ) {
+         if( p.table && itr->table != p.table ) continue;
+
+         result.rows.push_back( {itr->code, itr->scope, itr->table, itr->payer, itr->count} );
+
+         ++count;
+      }
+      if( itr != end_itr ) {
+         result.more = string(itr->scope);
+      }
+   };
+
+   auto lower = idx.lower_bound( lower_bound_lookup_tuple );
+   auto upper = idx.upper_bound( upper_bound_lookup_tuple );
+   if( p.reverse && *p.reverse ) {
+      walk_table_range( boost::make_reverse_iterator(upper), boost::make_reverse_iterator(lower) );
+   } else {
+      walk_table_range( lower, upper );
+   }
+
    return result;
 }
 
 vector<asset> read_only::get_currency_balance( const read_only::get_currency_balance_params& p )const {
 
    const abi_def abi = eosio::chain_apis::get_abi( db, p.code );
-   auto table_type = get_table_type( abi, "accounts" );
+   (void)get_table_type( abi, "accounts" );
 
    vector<asset> results;
    walk_key_value_table(p.code, p.account, N(accounts), [&](const key_value_object& obj){
@@ -1187,7 +1318,7 @@ fc::variant read_only::get_currency_stats( const read_only::get_currency_stats_p
    fc::mutable_variant_object results;
 
    const abi_def abi = eosio::chain_apis::get_abi( db, p.code );
-   auto table_type = get_table_type( abi, "stat" );
+   (void)get_table_type( abi, "stat" );
 
    uint64_t scope = ( eosio::chain::string_to_symbol( 0, boost::algorithm::to_upper_copy(p.symbol).c_str() ) >> 8 );
 
@@ -1208,12 +1339,6 @@ fc::variant read_only::get_currency_stats( const read_only::get_currency_stats_p
    return results;
 }
 
-// TODO: move this and similar functions to a header. Copied from wasm_interface.cpp.
-// TODO: fix strict aliasing violation
-static float64_t to_softfloat64( double d ) {
-   return *reinterpret_cast<float64_t*>(&d);
-}
-
 fc::variant get_global_row( const database& db, const abi_def& abi, const abi_serializer& abis, const fc::microseconds& abi_serializer_max_time_ms, bool shorten_abi_errors ) {
    const auto table_type = get_table_type(abi, N(global));
    EOS_ASSERT(table_type == read_only::KEYi64, chain::contract_table_query_exception, "Invalid table type ${type} for table global", ("type",table_type));
@@ -1230,7 +1355,7 @@ fc::variant get_global_row( const database& db, const abi_def& abi, const abi_se
    return abis.binary_to_variant(abis.get_table_type(N(global)), data, abi_serializer_max_time_ms, shorten_abi_errors );
 }
 
-read_only::get_producers_result read_only::get_producers( const read_only::get_producers_params& p ) const {
+read_only::get_producers_result read_only::get_producers( const read_only::get_producers_params& p ) const try {
    const abi_def abi = eosio::chain_apis::get_abi(db, config::system_account_name);
    const auto table_type = get_table_type(abi, N(producers));
    const abi_serializer abis{ abi, abi_serializer_max_time };
@@ -1278,6 +1403,20 @@ read_only::get_producers_result read_only::get_producers( const read_only::get_p
    }
 
    result.total_producer_vote_weight = get_global_row(d, abi, abis, abi_serializer_max_time, shorten_abi_errors)["total_producer_vote_weight"].as_double();
+   return result;
+} catch (...) {
+   read_only::get_producers_result result;
+
+   for (auto p : db.active_producers().producers) {
+      fc::variant row = fc::mutable_variant_object()
+         ("owner", p.producer_name)
+         ("producer_key", p.block_signing_key)
+         ("url", "")
+         ("total_votes", 0.0f);
+
+      result.rows.push_back(row);
+   }
+
    return result;
 }
 
@@ -1390,14 +1529,24 @@ read_only::get_scheduled_transactions( const read_only::get_scheduled_transactio
 
 fc::variant read_only::get_block(const read_only::get_block_params& params) const {
    signed_block_ptr block;
-   EOS_ASSERT(!params.block_num_or_id.empty() && params.block_num_or_id.size() <= 64, chain::block_id_type_exception, "Invalid Block number or ID, must be greater than 0 and less than 64 characters" );
-   try {
-      block = db.fetch_block_by_id(fc::variant(params.block_num_or_id).as<block_id_type>());
-      if (!block) {
-         block = db.fetch_block_by_number(fc::to_uint64(params.block_num_or_id));
-      }
+   optional<uint64_t> block_num;
 
-   } EOS_RETHROW_EXCEPTIONS(chain::block_id_type_exception, "Invalid block ID: ${block_num_or_id}", ("block_num_or_id", params.block_num_or_id))
+   EOS_ASSERT( !params.block_num_or_id.empty() && params.block_num_or_id.size() <= 64,
+               chain::block_id_type_exception,
+               "Invalid Block number or ID, must be greater than 0 and less than 64 characters"
+   );
+
+   try {
+      block_num = fc::to_uint64(params.block_num_or_id);
+   } catch( ... ) {}
+
+   if( block_num.valid() ) {
+      block = db.fetch_block_by_number( *block_num );
+   } else {
+      try {
+         block = db.fetch_block_by_id( fc::variant(params.block_num_or_id).as<block_id_type>() );
+      } EOS_RETHROW_EXCEPTIONS(chain::block_id_type_exception, "Invalid block ID: ${block_num_or_id}", ("block_num_or_id", params.block_num_or_id))
+   }
 
    EOS_ASSERT( block, unknown_block_exception, "Could not find block: ${block}", ("block", params.block_num_or_id));
 
@@ -1435,12 +1584,12 @@ fc::variant read_only::get_block_header_state(const get_block_header_state_param
    return vo;
 }
 
-void read_write::push_block(const read_write::push_block_params& params, next_function<read_write::push_block_results> next) {
+void read_write::push_block(read_write::push_block_params&& params, next_function<read_write::push_block_results> next) {
    try {
-      app().get_method<incoming::methods::block_sync>()(std::make_shared<signed_block>(params));
+      app().get_method<incoming::methods::block_sync>()(std::make_shared<signed_block>(std::move(params)));
       next(read_write::push_block_results{});
    } catch ( boost::interprocess::bad_alloc& ) {
-      raise(SIGUSR1);
+      chain_plugin::handle_db_exhaustion();
    } CATCH_AND_CALL(next);
 }
 
@@ -1449,18 +1598,19 @@ void read_write::push_transaction(const read_write::push_transaction_params& par
    try {
       auto pretty_input = std::make_shared<packed_transaction>();
       auto resolver = make_resolver(this, abi_serializer_max_time);
+      transaction_metadata_ptr ptrx;
       try {
          abi_serializer::from_variant(params, *pretty_input, resolver, abi_serializer_max_time);
+         ptrx = std::make_shared<transaction_metadata>( pretty_input );
       } EOS_RETHROW_EXCEPTIONS(chain::packed_transaction_type_exception, "Invalid packed transaction")
 
-      app().get_method<incoming::methods::transaction_async>()(pretty_input, true, [this, next](const fc::static_variant<fc::exception_ptr, transaction_trace_ptr>& result) -> void{
+      app().get_method<incoming::methods::transaction_async>()(ptrx, true, [this, next](const fc::static_variant<fc::exception_ptr, transaction_trace_ptr>& result) -> void{
          if (result.contains<fc::exception_ptr>()) {
             next(result.get<fc::exception_ptr>());
          } else {
             auto trx_trace_ptr = result.get<transaction_trace_ptr>();
 
             try {
-               chain::transaction_id_type id = trx_trace_ptr->id;
                fc::variant output;
                try {
                   output = db.to_variant_with_abi( *trx_trace_ptr, abi_serializer_max_time );
@@ -1468,6 +1618,7 @@ void read_write::push_transaction(const read_write::push_transaction_params& par
                   output = *trx_trace_ptr;
                }
 
+               const chain::transaction_id_type& id = trx_trace_ptr->id;
                next(read_write::push_transaction_results{id, output});
             } CATCH_AND_CALL(next);
          }
@@ -1475,7 +1626,7 @@ void read_write::push_transaction(const read_write::push_transaction_params& par
 
 
    } catch ( boost::interprocess::bad_alloc& ) {
-      raise(SIGUSR1);
+      chain_plugin::handle_db_exhaustion();
    } CATCH_AND_CALL(next);
 }
 
@@ -1489,7 +1640,7 @@ static void push_recurse(read_write* rw, int index, const std::shared_ptr<read_w
          results->emplace_back( r );
       }
 
-      int next_index = index + 1;
+      size_t next_index = index + 1;
       if (next_index < params->size()) {
          push_recurse(rw, next_index, params, results, next );
       } else {
@@ -1535,17 +1686,12 @@ read_only::get_code_results read_only::get_code( const get_code_params& params )
    EOS_ASSERT( params.code_as_wasm, unsupported_feature, "Returning WAST from get_code is no longer supported" );
 
    if( accnt.code.size() ) {
-      if (params.code_as_wasm) {
-         result.wasm = string(accnt.code.begin(), accnt.code.end());
-      } else {
-         result.wast = wasm_to_wast( (const uint8_t*)accnt.code.data(), accnt.code.size(), true );
-      }
-      result.code_hash = fc::sha256::hash( accnt.code.data(), accnt.code.size() );
+      result.wasm = string(accnt.code.begin(), accnt.code.end());
+      result.code_hash = accnt.code_version;
    }
 
    abi_def abi;
    if( abi_serializer::to_abi(accnt.abi, abi) ) {
-
       result.abi = std::move(abi);
    }
 
@@ -1559,7 +1705,7 @@ read_only::get_code_hash_results read_only::get_code_hash( const get_code_hash_p
    const auto& accnt  = d.get<account_object,by_name>( params.account_name );
 
    if( accnt.code.size() ) {
-      result.code_hash = fc::sha256::hash( accnt.code.data(), accnt.code.size() );
+      result.code_hash = accnt.code_version;
    }
 
    return result;
@@ -1584,7 +1730,7 @@ read_only::get_raw_abi_results read_only::get_raw_abi( const get_raw_abi_params&
    const auto& d = db.db();
    const auto& accnt = d.get<account_object,by_name>(params.account_name);
    result.abi_hash = fc::sha256::hash( accnt.abi.data(), accnt.abi.size() );
-   result.code_hash = fc::sha256::hash( accnt.code.data(), accnt.code.size() );
+   result.code_hash = accnt.code_version;
    if( !params.abi_hash || *params.abi_hash != result.abi_hash )
       result.abi = blob{{accnt.abi.begin(), accnt.abi.end()}};
 
@@ -1642,6 +1788,9 @@ read_only::get_account_results read_only::get_account( const get_account_params&
       const auto token_code = N(eosio.token);
 
       auto core_symbol = extract_core_symbol();
+
+      if (params.expected_core_symbol.valid())
+         core_symbol = *(params.expected_core_symbol);
 
       const auto* t_id = d.find<chain::table_id_object, chain::by_code_scope_table>(boost::make_tuple( token_code, params.account_name, N(accounts) ));
       if( t_id != nullptr ) {
@@ -1776,7 +1925,7 @@ namespace detail {
 }
 
 chain::symbol read_only::extract_core_symbol()const {
-   symbol core_symbol; // Default to CORE_SYMBOL if the appropriate data structure cannot be found in the system contract table data
+   symbol core_symbol(0);
 
    // The following code makes assumptions about the contract deployed on eosio account (i.e. the system contract) and how it stores its data.
    const auto& d = db.db();

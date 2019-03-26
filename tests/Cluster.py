@@ -30,6 +30,8 @@ class Cluster(object):
     __BiosPort=8788
     __LauncherCmdArr=[]
     __bootlog="eosio-ignition-wd/bootlog.txt"
+    __configDir="etc/eosio/"
+    __dataDir="var/lib/"
 
     # pylint: disable=too-many-arguments
     # walletd [True|False] Is keosd running. If not load the wallet plugin
@@ -81,6 +83,7 @@ class Cluster(object):
 
         self.useBiosBootFile=False
         self.filesToCleanup=[]
+        self.alternateVersionLabels=Cluster.__defaultAlternateVersionLabels()
 
 
     def setChainStrategy(self, chainSyncStrategy=Utils.SyncReplayTag):
@@ -91,13 +94,43 @@ class Cluster(object):
     def setWalletMgr(self, walletMgr):
         self.walletMgr=walletMgr
 
+    @staticmethod
+    def __defaultAlternateVersionLabels():
+        """Return a labels dictionary with just the "current" label to path set."""
+        labels={}
+        labels["current"]="./"
+        return labels
+
+    def setAlternateVersionLabels(self, file):
+        """From the provided file return a dictionary of labels to paths."""
+        Utils.Print("alternate file=%s" % (file))
+        self.alternateVersionLabels=Cluster.__defaultAlternateVersionLabels()
+        if file is None:
+            # only have "current"
+            return
+        if not os.path.exists(file):
+            Utils.errorExit("Alternate Version Labels file \"%s\" does not exist" % (file))
+        with open(file, 'r') as f:
+            content=f.read()
+            p=re.compile(r'^\s*(\w+)\s*=\s*([^\s](?:.*[^\s])?)\s*$', re.MULTILINE)
+            all=p.findall(content)
+            for match in all:
+                label=match[0]
+                path=match[1]
+                if label=="current":
+                    Utils.Print("ERROR: cannot overwrite default label %s with path=%s" % (label, path))
+                    continue
+                self.alternateVersionLabels[label]=path
+                if Utils.Debug: Utils.Print("Version label \"%s\" maps to \"%s\"" % (label, path))
+
     # launch local nodes and set self.nodes
     # pylint: disable=too-many-locals
     # pylint: disable=too-many-return-statements
     # pylint: disable=too-many-branches
     # pylint: disable=too-many-statements
     def launch(self, pnodes=1, totalNodes=1, prodCount=1, topo="mesh", p2pPlugin="net", delay=1, onlyBios=False, dontBootstrap=False,
-               totalProducers=None, extraNodeosArgs=None, useBiosBootFile=True, specificExtraNodeosArgs=None):
+               totalProducers=None, extraNodeosArgs=None, useBiosBootFile=True, specificExtraNodeosArgs=None, alternateVersionLabelsFile=None,
+               associatedNodeLabels=None):
         """Launch cluster.
         pnodes: producer nodes count
         totalNodes: producer + non-producer nodes count
@@ -113,8 +146,19 @@ class Cluster(object):
           A value of false uses manual bootstrapping in this script, which does not do things like stake votes for producers.
         specificExtraNodeosArgs: dictionary of arguments to pass to a specific node (via --specific-num and
                                  --specific-nodeos flags on launcher), example: { "5" : "--plugin eosio::test_control_api_plugin" }
+        alternateVersionLabelsFile: Supply an alternate version labels file to use with associatedNodeLabels.
+        associatedNodeLabels: Supply a dictionary of node numbers to use an alternate label for a specific node.
         """
         assert(isinstance(topo, str))
+        if alternateVersionLabelsFile is not None:
+            assert(isinstance(alternateVersionLabelsFile, str))
+        elif associatedNodeLabels is not None:
+            associatedNodeLabels=None    # need to supply alternateVersionLabelsFile to use labels
+
+        if associatedNodeLabels is not None:
+            assert(isinstance(associatedNodeLabels, dict))
+            Utils.Print("associatedNodeLabels size=%s" % (len(associatedNodeLabels)))
+        Utils.Print("alternateVersionLabelsFile=%s" % (alternateVersionLabelsFile))
 
         if not self.localCluster:
             Utils.Print("WARNING: Cluster not local, not launching %s." % (Utils.EosServerName))
@@ -123,6 +167,9 @@ class Cluster(object):
         if len(self.nodes) > 0:
             raise RuntimeError("Cluster already running.")
 
+        if pnodes > totalNodes:
+            raise RuntimeError("totalNodes (%d) must be equal to or greater than pnodes(%d)." % (totalNodes, pnodes))
+
         if self.walletMgr is None:
             self.walletMgr=WalletMgr(True)
 
@@ -130,6 +177,8 @@ class Cluster(object):
         if totalProducers:
             assert(isinstance(totalProducers, (str,int)))
             producerFlag="--producers %s" % (totalProducers)
+
+        self.setAlternateVersionLabels(alternateVersionLabelsFile)
 
         tries = 30
         while not Utils.arePortsAvailable(set(range(self.port, self.port+totalNodes+1))):
@@ -172,7 +221,21 @@ class Cluster(object):
                 cmdArr.append(arg)
 
         cmdArr.append("--max-block-cpu-usage")
-        cmdArr.append(str(2000000))
+        cmdArr.append(str(160000000))
+        cmdArr.append("--max-transaction-cpu-usage")
+        cmdArr.append(str(150000000))
+
+        if associatedNodeLabels is not None:
+            for nodeNum,label in associatedNodeLabels.items():
+                assert(isinstance(nodeNum, (str,int)))
+                assert(isinstance(label, str))
+                path=self.alternateVersionLabels.get(label)
+                if path is None:
+                    Utils.errorExit("associatedNodeLabels passed in indicates label %s for node num %s, but it was not identified in %s" % (label, nodeNum, alternateVersionLabelsFile))
+                cmdArr.append("--spcfc-inst-num")
+                cmdArr.append(str(nodeNum))
+                cmdArr.append("--spcfc-inst-nodeos")
+                cmdArr.append(path)
 
         # must be last cmdArr.append before subprocess.call, so that everything is on the command line
         # before constructing the shape.json file for "bridge"
@@ -266,7 +329,7 @@ class Cluster(object):
                                 producerGroup2.append(nodeName)
                                 Utils.Print("Group2 grouping producerIndex=%s, secondGroupStart=%s" % (producerIndex,secondGroupStart))
                         if group!=prodGroup:
-                            errorExit("Node configuration not consistent with \"bridge\" topology. Node %s has producers that fall into both halves of the bridged network" % (nodeName))
+                            Utils.errorExit("Node configuration not consistent with \"bridge\" topology. Node %s has producers that fall into both halves of the bridged network" % (nodeName))
 
             for _,bridgeNode in bridgeNodes.items():
                 bridgeNode["peers"]=[]
@@ -743,6 +806,14 @@ class Cluster(object):
         m=re.search(r"node_([\d]+)", name)
         return int(m.group(1))
 
+    @staticmethod
+    def nodeExtensionToName(ext):
+        r"""Convert node extension (bios, 0, 1, etc) to node name. """
+        prefix="node_"
+        if ext == "bios":
+            return prefix + ext
+
+        return "node_%02d" % (ext)
 
     @staticmethod
     def parseProducerKeys(configFile, nodeName):
@@ -781,8 +852,7 @@ class Cluster(object):
     def parseProducers(nodeNum):
         """Parse node config file for producers."""
 
-        node="node_%02d" % (nodeNum)
-        configFile="etc/eosio/%s/config.ini" % (node)
+        configFile=Cluster.__configDir + Cluster.nodeExtensionToName(nodeNum) + "/config.ini"
         if Utils.Debug: Utils.Print("Parsing config file %s" % configFile)
         configStr=None
         with open(configFile, 'r') as f:
@@ -800,20 +870,20 @@ class Cluster(object):
     def parseClusterKeys(totalNodes):
         """Parse cluster config file. Updates producer keys data members."""
 
-        node="node_bios"
-        configFile="etc/eosio/%s/config.ini" % (node)
+        nodeName=Cluster.nodeExtensionToName("bios")
+        configFile=Cluster.__configDir + nodeName + "/config.ini"
         if Utils.Debug: Utils.Print("Parsing config file %s" % configFile)
-        producerKeys=Cluster.parseProducerKeys(configFile, node)
+        producerKeys=Cluster.parseProducerKeys(configFile, nodeName)
         if producerKeys is None:
             Utils.Print("ERROR: Failed to parse eosio private keys from cluster config files.")
             return None
 
         for i in range(0, totalNodes):
-            node="node_%02d" % (i)
-            configFile="etc/eosio/%s/config.ini" % (node)
+            nodeName=Cluster.nodeExtensionToName(i)
+            configFile=Cluster.__configDir + nodeName + "/config.ini"
             if Utils.Debug: Utils.Print("Parsing config file %s" % configFile)
 
-            keys=Cluster.parseProducerKeys(configFile, node)
+            keys=Cluster.parseProducerKeys(configFile, nodeName)
             if keys is not None:
                 producerKeys.update(keys)
             keyMsg="None" if keys is None else len(keys)
@@ -821,7 +891,7 @@ class Cluster(object):
         return producerKeys
 
     @staticmethod
-    def bios_bootstrap(totalNodes, biosHost, biosPort, walletMgr):
+    def bios_bootstrap(totalNodes, biosHost, biosPort, walletMgr, silent=False):
         """Bootstrap cluster using the bios_boot.sh script generated by eosio-launcher."""
 
         Utils.Print("Starting cluster bootstrap.")
@@ -881,7 +951,7 @@ class Cluster(object):
         contract="eosio.token"
         action="transfer"
         for name, keys in producerKeys.items():
-            data="{\"from\":\"eosio\",\"to\":\"%s\",\"quantity\":\"%s\",\"memo\":\"%s\"}" % (name, initialFunds, "init transfer")
+            data="{\"from\":\"eosio\",\"to\":\"%s\",\"quantity\":\"%s\",\"memo\":\"%s\"}" % (name, initialFunds, "init eosio transfer")
             opts="--permission eosio@active"
             if name != "eosio":
                 trans=biosNode.pushMessage(contract, action, data, opts)
@@ -946,7 +1016,7 @@ class Cluster(object):
             return None
 
         contract="eosio.bios"
-        contractDir="contracts/%s" % (contract)
+        contractDir="unittests/contracts/%s" % (contract)
         wasmFile="%s.wasm" % (contract)
         abiFile="%s.abi" % (contract)
         Utils.Print("Publish %s contract" % (contract))
@@ -1070,7 +1140,7 @@ class Cluster(object):
             return None
 
         contract="eosio.token"
-        contractDir="contracts/%s" % (contract)
+        contractDir="unittests/contracts/%s" % (contract)
         wasmFile="%s.wasm" % (contract)
         abiFile="%s.abi" % (contract)
         Utils.Print("Publish %s contract" % (contract))
@@ -1125,7 +1195,7 @@ class Cluster(object):
             return None
 
         contract="eosio.system"
-        contractDir="contracts/%s" % (contract)
+        contractDir="unittests/contracts/%s" % (contract)
         wasmFile="%s.wasm" % (contract)
         abiFile="%s.abi" % (contract)
         Utils.Print("Publish %s contract" % (contract))
@@ -1156,7 +1226,10 @@ class Cluster(object):
         if not biosNode.waitForTransInBlock(transId):
             Utils.Print("ERROR: Failed to validate transaction %s got rolled into a block on server port %d." % (transId, biosNode.port))
             return None
-
+        action="init"
+        data="{\"version\":0,\"core\":\"4,%s\"}" % (CORE_SYMBOL)
+        opts="--permission %s@active" % (eosioAccount.name)
+        trans=biosNode.pushMessage(eosioAccount.name, action, data, opts)
         Utils.Print("Cluster bootstrap done.")
 
         return biosNode
@@ -1181,11 +1254,8 @@ class Cluster(object):
 
     @staticmethod
     def pgrepEosServerPattern(nodeInstance):
-        if isinstance(nodeInstance, str):
-            return r"[\n]?(\d+) (.* --data-dir var/lib/node_%s .*)\n" % nodeInstance
-        else:
-            nodeInstanceStr="%02d" % nodeInstance
-            return Cluster.pgrepEosServerPattern(nodeInstanceStr)
+        dataLocation=Cluster.__dataDir + Cluster.nodeExtensionToName(nodeInstance)
+        return r"[\n]?(\d+) (.* --data-dir %s .*)\n" % (dataLocation)
 
     # Populates list of EosInstanceInfo objects, matched to actual running instances
     def discoverLocalNodes(self, totalNodes, timeout=None):
@@ -1243,21 +1313,21 @@ class Cluster(object):
         time.sleep(1) # Give processes time to stand down
         return True
 
-    def relaunchEosInstances(self):
+    def relaunchEosInstances(self, cachePopen=False):
 
         chainArg=self.__chainSyncStrategy.arg
 
         newChain= False if self.__chainSyncStrategy.name in [Utils.SyncHardReplayTag, Utils.SyncNoneTag] else True
         for i in range(0, len(self.nodes)):
             node=self.nodes[i]
-            if node.killed and not node.relaunch(i, chainArg, newChain=newChain):
+            if node.killed and not node.relaunch(i, chainArg, newChain=newChain, cachePopen=cachePopen):
                 return False
 
         return True
 
     @staticmethod
     def dumpErrorDetailImpl(fileName):
-        Utils.Print("=================================================================")
+        Utils.Print(Utils.FileDivider)
         Utils.Print("Contents of %s:" % (fileName))
         if os.path.exists(fileName):
             with open(fileName, "r") as f:
@@ -1265,17 +1335,36 @@ class Cluster(object):
         else:
             Utils.Print("File %s not found." % (fileName))
 
+    @staticmethod
+    def __findFiles(path):
+        files=[]
+        it=os.scandir(path)
+        for entry in it:
+            if entry.is_file(follow_symlinks=False):
+                match=re.match("stderr\..+\.txt", entry.name)
+                if match:
+                    files.append(os.path.join(path, entry.name))
+        files.sort()
+        return files
+
     def dumpErrorDetails(self):
-        fileName="etc/eosio/node_bios/config.ini"
+        fileName=os.path.join(Cluster.__configDir + Cluster.nodeExtensionToName("bios"), "config.ini")
         Cluster.dumpErrorDetailImpl(fileName)
-        fileName="var/lib/node_bios/stderr.txt"
-        Cluster.dumpErrorDetailImpl(fileName)
+        path=Cluster.__dataDir + Cluster.nodeExtensionToName("bios")
+        fileNames=Cluster.__findFiles(path)
+        for fileName in fileNames:
+            Cluster.dumpErrorDetailImpl(fileName)
 
         for i in range(0, len(self.nodes)):
-            fileName="etc/eosio/node_%02d/config.ini" % (i)
+            configLocation=Cluster.__configDir + Cluster.nodeExtensionToName(i)
+            fileName=os.path.join(configLocation, "config.ini")
             Cluster.dumpErrorDetailImpl(fileName)
-            fileName="var/lib/node_%02d/stderr.txt" % (i)
+            fileName=os.path.join(configLocation, "genesis.json")
             Cluster.dumpErrorDetailImpl(fileName)
+            path=Cluster.__dataDir + Cluster.nodeExtensionToName(i)
+            fileNames=Cluster.__findFiles(path)
+            for fileName in fileNames:
+                Cluster.dumpErrorDetailImpl(fileName)
 
         if self.useBiosBootFile:
             Cluster.dumpErrorDetailImpl(Cluster.__bootlog)
@@ -1346,9 +1435,9 @@ class Cluster(object):
         return node.waitForNextBlock(timeout)
 
     def cleanup(self):
-        for f in glob.glob("var/lib/node_*"):
+        for f in glob.glob(Cluster.__dataDir + "node_*"):
             shutil.rmtree(f)
-        for f in glob.glob("etc/eosio/node_*"):
+        for f in glob.glob(Cluster.__configDir + "node_*"):
             shutil.rmtree(f)
 
         for f in self.filesToCleanup:
@@ -1403,3 +1492,134 @@ class Cluster(object):
                     node.reportStatus()
                 except:
                     Utils.Print("No reportStatus")
+
+    def printBlockLogIfNeeded(self):
+        printBlockLog=False
+        if hasattr(self, "nodes") and self.nodes is not None:
+            for node in self.nodes:
+                if node.missingTransaction:
+                    printBlockLog=True
+                    break
+
+        if hasattr(self, "biosNode") and self.biosNode is not None and self.biosNode.missingTransaction:
+            printBlockLog=True
+
+        if not printBlockLog:
+            return
+
+        self.printBlockLog()
+
+    def getBlockLog(self, nodeExtension):
+        blockLogDir=Cluster.__dataDir + Cluster.nodeExtensionToName(nodeExtension) + "/blocks/"
+        return Utils.getBlockLog(blockLogDir, exitOnError=False)
+
+    def printBlockLog(self):
+        blockLogBios=self.getBlockLog("bios")
+        Utils.Print(Utils.FileDivider)
+        Utils.Print("Block log from %s:\n%s" % ("bios", json.dumps(blockLogBios, indent=1)))
+
+        if not hasattr(self, "nodes"):
+            return
+
+        numNodes=len(self.nodes)
+        for i in range(numNodes):
+            node=self.nodes[i]
+            blockLog=self.getBlockLog(i)
+            Utils.Print(Utils.FileDivider)
+            Utils.Print("Block log from node %s:\n%s" % (i, json.dumps(blockLog, indent=1)))
+
+
+    def compareBlockLogs(self):
+        blockLogs=[]
+        blockNameExtensions=[]
+        lowestMaxes=[]
+
+        def back(arr):
+            return arr[len(arr)-1]
+
+        def sortLowest(maxes,max):
+            for i in range(len(maxes)):
+                if max < maxes[i]:
+                    maxes.insert(i, max)
+                    return
+
+            maxes.append(max)
+
+        i="bios"
+        blockLog=self.getBlockLog(i)
+        if blockLog is None:
+            Utils.errorExit("Node %s does not have a block log, all nodes must have a block log" % (i))
+        blockLogs.append(blockLog)
+        blockNameExtensions.append(i)
+        sortLowest(lowestMaxes,back(blockLog)["block_num"])
+
+        if not hasattr(self, "nodes"):
+            Utils.errorExit("There are not multiple nodes to compare, this method assumes that two nodes or more are expected")
+
+        numNodes=len(self.nodes)
+        for i in range(numNodes):
+            node=self.nodes[i]
+            blockLog=self.getBlockLog(i)
+            if blockLog is None:
+                Utils.errorExit("Node %s does not have a block log, all nodes must have a block log" % (i))
+            blockLogs.append(blockLog)
+            blockNameExtensions.append(i)
+            sortLowest(lowestMaxes,back(blockLog)["block_num"])
+
+        numNodes=len(blockLogs)
+
+        if numNodes < 2:
+            Utils.errorExit("There are not multiple nodes to compare, this method assumes that two nodes or more are expected")
+
+        if lowestMaxes[0] < 2:
+            Utils.errorExit("One or more nodes only has %d blocks, if that is a valid scenario, then compareBlockLogs shouldn't be called" % (lowestMaxes[0]))
+
+        # create a list of block logs and name extensions for the given common block number span
+        def identifyCommon(blockLogs, blockNameExtensions, first, last):
+            commonBlockLogs=[]
+            commonBlockNameExtensions=[]
+            for i in range(numNodes):
+                if (len(blockLogs[i]) >= last): 
+                    commonBlockLogs.append(blockLogs[i][first:last])
+                    commonBlockNameExtensions.append(blockNameExtensions[i])
+            return (commonBlockLogs,commonBlockNameExtensions) 
+
+        # compare the contents of the blockLogs for the given common block number span
+        def compareCommon(blockLogs, blockNameExtensions, first, last):
+            if Utils.Debug: Utils.Print("comparing block num %s through %s" % (first, last))
+            commonBlockLogs=None
+            commonBlockNameExtensions=None
+            (commonBlockLogs,commonBlockNameExtensions) = identifyCommon(blockLogs, blockNameExtensions, first, last)
+            numBlockLogs=len(commonBlockLogs)
+            if numBlockLogs < 2:
+                return False
+
+            ret=None
+            for i in range(1,numBlockLogs):
+                context="<comparing block logs for node[%s] and node[%s]>" % (commonBlockNameExtensions[0], commonBlockNameExtensions[i])
+                if Utils.Debug: Utils.Print("context=%s" % (context))
+                ret=Utils.compare(commonBlockLogs[0], commonBlockLogs[i], context)
+                if ret is not None:
+                    blockLogDir1=Cluster.__dataDir + Cluster.nodeExtensionToName(commonBlockNameExtensions[0]) + "/blocks/"
+                    blockLogDir2=Cluster.__dataDir + Cluster.nodeExtensionToName(commonBlockNameExtensions[i]) + "/blocks/"
+                    Utils.Print(Utils.FileDivider)
+                    Utils.Print("Block log from %s:\n%s" % (blockLogDir1, json.dumps(commonBlockLogs[0], indent=1)))
+                    Utils.Print(Utils.FileDivider)
+                    Utils.Print("Block log from %s:\n%s" % (blockLogDir2, json.dumps(commonBlockLogs[i], indent=1)))
+                    Utils.Print(Utils.FileDivider)
+                    Utils.errorExit("Block logs do not match, difference description -> %s" % (ret))
+
+            return True
+
+        def stripValues(lowestMaxes,greaterThan):
+            newLowest=[]
+            for low in lowestMaxes:
+                if low > greaterThan:
+                    newLowest.append(low)
+            return newLowest
+
+        first=0
+        while len(lowestMaxes)>0 and compareCommon(blockLogs, blockNameExtensions, first, lowestMaxes[0]):
+            first=lowestMaxes[0]+1
+            lowestMaxes=stripValues(lowestMaxes,lowestMaxes[0])
+

@@ -6,6 +6,7 @@ import os
 import re
 import datetime
 import json
+import signal
 
 from core_symbol import CORE_SYMBOL
 from testUtils import Utils
@@ -50,6 +51,8 @@ class Node(object):
         self.lastRetrievedLIB=None
         self.transCache={}
         self.walletMgr=walletMgr
+        self.missingTransaction=False
+        self.popenProc=None           # initial process is started by launcher, this will only be set on relaunch
         if self.enableMongo:
             self.mongoEndpointArgs += "--host %s --port %d %s" % (mongoHost, mongoPort, mongoDb)
 
@@ -188,7 +191,7 @@ class Node(object):
         outStr=Node.byteArrToStr(outs)
         if not outStr:
             return None
-        extJStr=Utils.filterJsonObject(outStr)
+        extJStr=Utils.filterJsonObjectOrArray(outStr)
         if not extJStr:
             return None
         jStr=Node.normalizeJsonObject(extJStr)
@@ -258,14 +261,20 @@ class Node(object):
             cmd="%s %s" % (Utils.MongoPath, self.mongoEndpointArgs)
             subcommand='db.blocks.findOne( { "block_num": %d } )' % (blockNum)
             if Utils.Debug: Utils.Print("cmd: echo '%s' | %s" % (subcommand, cmd))
+            start=time.perf_counter()
             try:
                 block=Node.runMongoCmdReturnJson(cmd.split(), subcommand, exitOnError=exitOnError)
+                if Utils.Debug:
+                    end=time.perf_counter()
+                    Utils.Print("cmd Duration: %.3f sec" % (end-start))
+
                 if block is not None:
                     return block
             except subprocess.CalledProcessError as ex:
                 if not silentErrors:
+                    end=time.perf_counter()
                     msg=ex.output.decode("utf-8")
-                    errorMsg="Exception during get db node get block. %s" % (msg)
+                    errorMsg="Exception during get db node get block.  cmd Duration: %.3f sec. %s" % (end-start, msg)
                     if exitOnError:
                         Utils.cmdError(errorMsg)
                         Utils.errorExit(errorMsg)
@@ -279,14 +288,19 @@ class Node(object):
         cmd="%s %s" % (Utils.MongoPath, self.mongoEndpointArgs)
         subcommand='db.blocks.findOne( { "block_id": "%s" } )' % (blockId)
         if Utils.Debug: Utils.Print("cmd: echo '%s' | %s" % (subcommand, cmd))
+        start=time.perf_counter()
         try:
             trans=Node.runMongoCmdReturnJson(cmd.split(), subcommand)
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
             if trans is not None:
                 return trans
         except subprocess.CalledProcessError as ex:
             if not silentErrors:
+                end=time.perf_counter()
                 msg=ex.output.decode("utf-8")
-                Utils.Print("ERROR: Exception during db get block by id. %s" % (msg))
+                Utils.Print("ERROR: Exception during db get block by id.  cmd Duration: %.3f sec. %s" % (end-start, msg))
             return None
 
         return None
@@ -324,60 +338,11 @@ class Node(object):
         """Is blockNum finalized"""
         return self.isBlockPresent(blockNum, blockType=BlockType.lib)
 
-    class BlockWalker:
-        def __init__(self, node, transId, startBlockNum=None, endBlockNum=None):
-            assert(isinstance(transId, str))
-            self.trans=None
-            self.transId=transId
-            self.node=node
-            self.startBlockNum=startBlockNum
-            self.endBlockNum=endBlockNum
-
-        def walkBlocks(self):
-            start=None
-            end=None
-            if self.trans is None and self.transId in self.transCache.keys():
-                self.trans=self.transCache[self.transId]
-            if self.trans is not None:
-                cntxt=Node.Context(self.trans, "trans")
-                cntxt.add("processed")
-                cntxt.add("action_traces")
-                cntxt.index(0)
-                blockNum=cntxt.add("block_num")
-            else:
-                blockNum=None
-            # it should be blockNum or later, but just in case the block leading up have any clues...
-            start=None
-            if self.startBlockNum is not None:
-                start=self.startBlockNum
-            elif blockNum is not None:
-                start=blockNum-5
-            if self.endBlockNum is not None:
-                end=self.endBlockNum
-            else:
-                info=self.node.getInfo()
-                end=info["head_block_num"]
-            if start is None:
-                if end > 100:
-                    start=end-100
-                else:
-                    start=0
-            transDesc=" id =%s" % (self.transId)
-            if self.trans is not None:
-                transDesc="=%s" % (json.dumps(self.trans, indent=2, sort_keys=True))
-            msg="Original transaction%s\nExpected block_num=%s\n" % (transDesc, blockNum)
-            for blockNum in range(start, end+1):
-                block=self.node.getBlock(blockNum)
-                msg+=json.dumps(block, indent=2, sort_keys=True)+"\n"
-
-            return msg
-
     # pylint: disable=too-many-branches
     def getTransaction(self, transId, silentErrors=False, exitOnError=False, delayedRetry=True):
         assert(isinstance(transId, str))
         exitOnErrorForDelayed=not delayedRetry and exitOnError
         timeout=3
-        blockWalker=None
         if not self.enableMongo:
             cmdDesc="get transaction"
             cmd="%s %s" % (cmdDesc, transId)
@@ -386,12 +351,10 @@ class Node(object):
                 trans=self.processCleosCmd(cmd, cmdDesc, silentErrors=silentErrors, exitOnError=exitOnErrorForDelayed, exitMsg=msg)
                 if trans is not None or not delayedRetry:
                     return trans
-                if blockWalker is None:
-                    blockWalker=Node.BlockWalker(self, transId)
                 if Utils.Debug: Utils.Print("Could not find transaction with id %s, delay and retry" % (transId))
                 time.sleep(timeout)
 
-            msg+="\nBlock printout -->>\n%s" % blockWalker.walkBlocks();
+            self.missingTransaction=True
             # either it is there or the transaction has timed out
             return self.processCleosCmd(cmd, cmdDesc, silentErrors=silentErrors, exitOnError=exitOnError, exitMsg=msg)
         else:
@@ -410,13 +373,18 @@ class Node(object):
         #subcommand='db.Transactions.findOne( { $and : [ { "trx_id": "%s" }, {"irreversible":true} ] } )' % (transId)
         subcommand='db.transactions.findOne( { "trx_id": "%s" } )' % (transId)
         if Utils.Debug: Utils.Print("cmd: echo '%s' | %s" % (subcommand, cmd))
+        start=time.perf_counter()
         try:
             trans=Node.runMongoCmdReturnJson(cmd.split(), subcommand, exitOnError=exitOnError)
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
             if trans is not None:
                 return trans
         except subprocess.CalledProcessError as ex:
+            end=time.perf_counter()
             msg=ex.output.decode("utf-8")
-            errorMsg="Exception during get db node get trans in mongodb with transaction id=%s. %s" % (transId,msg)
+            errorMsg="Exception during get db node get trans in mongodb with transaction id=%s.  cmd Duration: %.3f sec.  %s" % (transId, end-start, msg)
             if exitOnError:
                 Utils.cmdError("" % (errorMsg))
                 Utils.errorExit("Failed to retrieve transaction in mongodb for transaction id=%s" % (transId))
@@ -581,14 +549,16 @@ class Node(object):
 
         return self.waitForTransBlockIfNeeded(trans, waitForTransBlock, exitOnError=exitOnError)
 
-    def getEosAccount(self, name, exitOnError=False):
+    def getEosAccount(self, name, exitOnError=False, returnType=ReturnType.json, avoidMongo=False):
         assert(isinstance(name, str))
-        if not self.enableMongo:
+        if not self.enableMongo or avoidMongo:
             cmdDesc="get account"
-            cmd="%s -j %s" % (cmdDesc, name)
+            jsonFlag="-j" if returnType==ReturnType.json else ""
+            cmd="%s %s %s" % (cmdDesc, jsonFlag, name)
             msg="( getEosAccount(name=%s) )" % (name);
-            return self.processCleosCmd(cmd, cmdDesc, silentErrors=False, exitOnError=exitOnError, exitMsg=msg)
+            return self.processCleosCmd(cmd, cmdDesc, silentErrors=False, exitOnError=exitOnError, exitMsg=msg, returnType=returnType)
         else:
+            assert returnType == ReturnType.json, "MongoDB only supports a returnType of ReturnType.json" 
             return self.getEosAccountFromDb(name, exitOnError=exitOnError)
 
     def getEosAccountFromDb(self, name, exitOnError=False):
@@ -598,15 +568,20 @@ class Node(object):
         try:
             timeout = 3
             for i in range(0,(int(60/timeout) - 1)):
+                start=time.perf_counter()
                 trans=Node.runMongoCmdReturnJson(cmd.split(), subcommand, exitOnError=exitOnError)
                 if trans is not None:
+                    if Utils.Debug:
+                        end=time.perf_counter()
+                        Utils.Print("cmd Duration: %.3f sec" % (end-start))
                     return trans
                 time.sleep(timeout)
             return trans
         except subprocess.CalledProcessError as ex:
             msg=ex.output.decode("utf-8")
             if exitOnError:
-                Utils.cmdError("Exception during get account from db for %s. %s" % (name, msg))
+                end=time.perf_counter()
+                Utils.cmdError("Exception during get account from db for %s.  cmd Duration: %.3f sec.  %s" % (name, end-start, msg))
                 Utils.errorExit("Failed during get account from db for %s. %s" % (name, msg))
 
             Utils.Print("ERROR: Exception during get account from db for %s. %s" % (name, msg))
@@ -725,12 +700,17 @@ class Node(object):
         s=" ".join(cmdArr)
         if Utils.Debug: Utils.Print("cmd: %s" % (s))
         trans=None
+        start=time.perf_counter()
         try:
             trans=Utils.runCmdArrReturnJson(cmdArr)
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
             self.trackCmdTransaction(trans)
         except subprocess.CalledProcessError as ex:
+            end=time.perf_counter()
             msg=ex.output.decode("utf-8")
-            Utils.Print("ERROR: Exception during funds transfer. %s" % (msg))
+            Utils.Print("ERROR: Exception during funds transfer.  cmd Duration: %.3f sec.  %s" % (end-start, msg))
             if exitOnError:
                 Utils.cmdError("could not transfer \"%s\" from %s to %s" % (amountStr, source, destination))
                 Utils.errorExit("Failed to transfer \"%s\" from %s to %s" % (amountStr, source, destination))
@@ -834,13 +814,18 @@ class Node(object):
         cmd="%s %s" % (Utils.MongoPath, self.mongoEndpointArgs)
         subcommand='db.action_traces.find({$or: [{"act.data.from":"%s"},{"act.data.to":"%s"}]}).sort({"_id":%d}).limit(%d)' % (account.name, account.name, pos, abs(offset))
         if Utils.Debug: Utils.Print("cmd: echo '%s' | %s" % (subcommand, cmd))
+        start=time.perf_counter()
         try:
             actions=Node.runMongoCmdReturnJson(cmd.split(), subcommand, exitOnError=exitOnError)
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
             if actions is not None:
                 return actions
         except subprocess.CalledProcessError as ex:
+            end=time.perf_counter()
             msg=ex.output.decode("utf-8")
-            errorMsg="Exception during get db actions. %s" % (msg)
+            errorMsg="Exception during get db actions.  cmd Duration: %.3f sec.  %s" % (end-start, msg)
             if exitOnError:
                 Utils.cmdError(errorMsg)
                 Utils.errorExit(errorMsg)
@@ -884,8 +869,12 @@ class Node(object):
     def getAccountCodeHash(self, account):
         cmd="%s %s get code %s" % (Utils.EosClientPath, self.eosClientArgs(), account)
         if Utils.Debug: Utils.Print("cmd: %s" % (cmd))
+        start=time.perf_counter()
         try:
             retStr=Utils.checkOutput(cmd.split())
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
             #Utils.Print ("get code> %s"% retStr)
             p=re.compile(r'code\shash: (\w+)\n', re.MULTILINE)
             m=p.search(retStr)
@@ -896,8 +885,9 @@ class Node(object):
 
             return m.group(1)
         except subprocess.CalledProcessError as ex:
+            end=time.perf_counter()
             msg=ex.output.decode("utf-8")
-            Utils.Print("ERROR: Exception during code hash retrieval. %s" % (msg))
+            Utils.Print("ERROR: Exception during code hash retrieval.  cmd Duration: %.3f sec.  %s" % (end-start, msg))
             return None
 
     # publish contract and return transaction as json object
@@ -907,13 +897,18 @@ class Node(object):
         cmd += "" if abiFile is None else (" " + abiFile)
         if Utils.Debug: Utils.Print("cmd: %s" % (cmd))
         trans=None
+        start=time.perf_counter()
         try:
             trans=Utils.runCmdReturnJson(cmd, trace=False)
             self.trackCmdTransaction(trans)
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
         except subprocess.CalledProcessError as ex:
             if not shouldFail:
+                end=time.perf_counter()
                 msg=ex.output.decode("utf-8")
-                Utils.Print("ERROR: Exception during code hash retrieval. %s" % (msg))
+                Utils.Print("ERROR: Exception during code hash retrieval.  cmd Duration: %.3f sec.  %s" % (end-start, msg))
                 return None
             else:
                 retMap={}
@@ -965,14 +960,19 @@ class Node(object):
             cmdArr += opts.split()
         s=" ".join(cmdArr)
         if Utils.Debug: Utils.Print("cmd: %s" % (cmdArr))
+        start=time.perf_counter()
         try:
             trans=Utils.runCmdArrReturnJson(cmdArr)
             self.trackCmdTransaction(trans, ignoreNonTrans=True)
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
             return (True, trans)
         except subprocess.CalledProcessError as ex:
             msg=ex.output.decode("utf-8")
             if not silentErrors:
-                Utils.Print("ERROR: Exception during push message. %s" % (msg))
+                end=time.perf_counter()
+                Utils.Print("ERROR: Exception during push message.  cmd Duration=%.3f sec.  %s" % (end - start, msg))
             return (False, msg)
 
     def setPermission(self, account, code, pType, requirement, waitForTransBlock=False, exitOnError=False):
@@ -991,6 +991,19 @@ class Node(object):
         transferStr="--transfer" if transferTo else ""
         cmd="%s -j %s %s \"%s %s\" \"%s %s\" %s" % (
             cmdDesc, fromAccount.name, toAccount.name, netQuantity, CORE_SYMBOL, cpuQuantity, CORE_SYMBOL, transferStr)
+        msg="fromAccount=%s, toAccount=%s" % (fromAccount.name, toAccount.name);
+        trans=self.processCleosCmd(cmd, cmdDesc, exitOnError=exitOnError, exitMsg=msg)
+        self.trackCmdTransaction(trans)
+
+        return self.waitForTransBlockIfNeeded(trans, waitForTransBlock, exitOnError=exitOnError)
+
+    def undelegatebw(self, fromAccount, netQuantity, cpuQuantity, toAccount=None, waitForTransBlock=False, exitOnError=False):
+        if toAccount is None:
+            toAccount=fromAccount
+
+        cmdDesc="system undelegatebw"
+        cmd="%s -j %s %s \"%s %s\" \"%s %s\"" % (
+            cmdDesc, fromAccount.name, toAccount.name, netQuantity, CORE_SYMBOL, cpuQuantity, CORE_SYMBOL)
         msg="fromAccount=%s, toAccount=%s" % (fromAccount.name, toAccount.name);
         trans=self.processCleosCmd(cmd, cmdDesc, exitOnError=exitOnError, exitMsg=msg)
         self.trackCmdTransaction(trans)
@@ -1026,6 +1039,7 @@ class Node(object):
         else:
             exitMsg=""
         trans=None
+        start=time.perf_counter()
         try:
             if returnType==ReturnType.json:
                 trans=Utils.runCmdReturnJson(cmd, silentErrors=silentErrors)
@@ -1033,10 +1047,15 @@ class Node(object):
                 trans=Utils.runCmdReturnStr(cmd)
             else:
                 unhandledEnumType(returnType)
+
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
         except subprocess.CalledProcessError as ex:
             if not silentErrors:
+                end=time.perf_counter()
                 msg=ex.output.decode("utf-8")
-                errorMsg="Exception during \"%s\". Exception message: %s. %s" % (cmdDesc, msg, exitMsg)
+                errorMsg="Exception during \"%s\". Exception message: %s.  cmd Duration=%.3f sec. %s" % (cmdDesc, msg, end-start, exitMsg)
                 if exitOnError:
                     Utils.cmdError(errorMsg)
                     Utils.errorExit(errorMsg)
@@ -1046,7 +1065,7 @@ class Node(object):
 
         if exitOnError and trans is None:
             Utils.cmdError("could not \"%s\". %s" % (cmdDesc,exitMsg))
-            errorExit("Failed to \"%s\"" % (cmdDesc))
+            Utils.errorExit("Failed to \"%s\"" % (cmdDesc))
 
         return trans
 
@@ -1060,6 +1079,7 @@ class Node(object):
             (self.endpointHttp, producer, whereInSequence, basedOnLib)
         if Utils.Debug: Utils.Print("cmd: %s" % (cmd))
         rtn=None
+        start=time.perf_counter()
         try:
             if returnType==ReturnType.json:
                 rtn=Utils.runCmdReturnJson(cmd, silentErrors=silentErrors)
@@ -1067,10 +1087,15 @@ class Node(object):
                 rtn=Utils.runCmdReturnStr(cmd)
             else:
                 unhandledEnumType(returnType)
+
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
         except subprocess.CalledProcessError as ex:
             if not silentErrors:
+                end=time.perf_counter()
                 msg=ex.output.decode("utf-8")
-                errorMsg="Exception during \"%s\". %s" % (cmd, msg)
+                errorMsg="Exception during \"%s\". %s.  cmd Duration=%.3f sec." % (cmd, msg, end-start)
                 if exitOnError:
                     Utils.cmdError(errorMsg)
                     Utils.errorExit(errorMsg)
@@ -1115,12 +1140,17 @@ class Node(object):
         cmd="%s %s" % (Utils.MongoPath, self.mongoEndpointArgs)
         subcommand="db.blocks.find().sort({\"_id\":%d}).limit(1).pretty()" % (idx)
         if Utils.Debug: Utils.Print("cmd: echo \"%s\" | %s" % (subcommand, cmd))
+        start=time.perf_counter()
         try:
             trans=Node.runMongoCmdReturnJson(cmd.split(), subcommand)
+            if Utils.Debug:
+                end=time.perf_counter()
+                Utils.Print("cmd Duration: %.3f sec" % (end-start))
             return trans
         except subprocess.CalledProcessError as ex:
+            end=time.perf_counter()
             msg=ex.output.decode("utf-8")
-            Utils.Print("ERROR: Exception during get db block. %s" % (msg))
+            Utils.Print("ERROR: Exception during get db block.  cmd Duration: %.3f sec.  %s" % (end-start, msg))
             return None
 
     def checkPulse(self, exitOnError=False):
@@ -1190,9 +1220,21 @@ class Node(object):
         self.killed=True
         return True
 
+    def interruptAndVerifyExitStatus(self):
+        if Utils.Debug: Utils.Print("terminating node: %s" % (self.cmd))
+        assert self.popenProc is not None, "node: \"%s\" does not have a popenProc, this may be because it is only set after a relaunch." % (self.cmd)
+        self.popenProc.send_signal(signal.SIGINT)
+        try:
+            outs, _ = self.popenProc.communicate(timeout=15)
+            assert self.popenProc.returncode == 0, "Expected terminating \"%s\" to have an exit status of 0, but got %d" % (self.cmd, self.popenProc.returncode)
+        except subprocess.TimeoutExpired:
+            Utils.errorExit("Terminate call failed on node: %s" % (self.cmd))
+
     def verifyAlive(self, silent=False):
         if not silent and Utils.Debug: Utils.Print("Checking if node(pid=%s) is alive(killed=%s): %s" % (self.pid, self.killed, self.cmd))
         if self.killed or self.pid is None:
+            self.killed=True
+            self.pid=None
             return False
 
         try:
@@ -1204,8 +1246,8 @@ class Node(object):
             return False
         except PermissionError as ex:
             return True
-        else:
-            return True
+
+        return True
 
     def getBlockProducerByNum(self, blockNum, timeout=None, waitForBlock=True, exitOnError=True):
         if waitForBlock:
@@ -1214,7 +1256,7 @@ class Node(object):
         blockProducer=block["producer"]
         if blockProducer is None and exitOnError:
             Utils.cmdError("could not get producer for block number %s" % (blockNum))
-            errorExit("Failed to get block's producer")
+            Utils.errorExit("Failed to get block's producer")
         return blockProducer
 
     def getBlockProducer(self, timeout=None, waitForBlock=True, exitOnError=True, blockType=BlockType.head):
@@ -1223,7 +1265,7 @@ class Node(object):
         blockProducer=block["producer"]
         if blockProducer is None and exitOnError:
             Utils.cmdError("could not get producer for block number %s" % (blockNum))
-            errorExit("Failed to get block's producer")
+            Utils.errorExit("Failed to get block's producer")
         return blockProducer
 
     def getNextCleanProductionCycle(self, trans):
@@ -1253,7 +1295,7 @@ class Node(object):
 
     # TBD: make nodeId an internal property
     # pylint: disable=too-many-locals
-    def relaunch(self, nodeId, chainArg, newChain=False, timeout=Utils.systemWaitTimeout, addOrSwapFlags=None):
+    def relaunch(self, nodeId, chainArg, newChain=False, timeout=Utils.systemWaitTimeout, addOrSwapFlags=None, cachePopen=False):
 
         assert(self.pid is None)
         assert(self.killed)
@@ -1300,6 +1342,8 @@ class Node(object):
             cmd=myCmd + ("" if chainArg is None else (" " + chainArg))
             Utils.Print("cmd: %s" % (cmd))
             popen=subprocess.Popen(cmd.split(), stdout=sout, stderr=serr)
+            if cachePopen:
+                self.popenProc=popen
             self.pid=popen.pid
             if Utils.Debug: Utils.Print("restart Node host=%s, port=%s, pid=%s, cmd=%s" % (self.host, self.port, self.pid, self.cmd))
 

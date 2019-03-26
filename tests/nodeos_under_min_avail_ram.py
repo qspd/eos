@@ -48,13 +48,14 @@ class NamedAccounts:
         Print("NamedAccounts Name for %d is %s" % (temp, retStr))
         return retStr
 
+
 ###############################################################
 # nodeos_voting_test
 # --dump-error-details <Upon error print etc/eosio/node_*/config.ini and var/lib/node_*/stderr.log to stdout>
 # --keep-logs <Don't delete var/lib/node_* folders upon test completion>
 ###############################################################
 
-args = TestHelper.parse_args({"--dump-error-details","--keep-logs","-v","--leave-running","--clean-run"})
+args = TestHelper.parse_args({"--dump-error-details","--keep-logs","-v","--leave-running","--clean-run","--wallet-port"})
 Utils.Debug=args.v
 totalNodes=4
 cluster=Cluster(walletd=True)
@@ -62,8 +63,9 @@ dumpErrorDetails=args.dump_error_details
 keepLogs=args.keep_logs
 dontKill=args.leave_running
 killAll=args.clean_run
+walletPort=args.wallet_port
 
-walletMgr=WalletMgr(True)
+walletMgr=WalletMgr(True, port=walletPort)
 testSuccessful=False
 killEosInstances=not dontKill
 killWallet=not dontKill
@@ -133,7 +135,7 @@ try:
     nodes[0].transferFunds(cluster.eosioAccount, contractAccount, transferAmount, "test transfer")
     trans=nodes[0].delegatebw(contractAccount, 1000000.0000, 88000000.0000, waitForTransBlock=True, exitOnError=True)
 
-    contractDir="contracts/integration_test"
+    contractDir="unittests/test-contracts/integration_test"
     wasmFile="integration_test.wasm"
     abiFile="integration_test.abi"
     Print("Publish contract")
@@ -150,6 +152,7 @@ try:
     count=0
     while keepProcessing:
         numAmount+=1
+        timeOutCount=0
         for fromIndex in range(namedAccounts.numAccounts):
             count+=1
             toIndex=fromIndex+1
@@ -162,8 +165,15 @@ try:
             try:
                 trans=nodes[0].pushMessage(contract, action, data, opts)
                 if trans is None or not trans[0]:
+                    timeOutCount+=1
+                    if timeOutCount>=3:
+                       Print("Failed to push create action to eosio contract for %d consecutive times, looks like nodeos already exited." % (timeOutCount))
+                       keepProcessing=False
+                       break
                     Print("Failed to push create action to eosio contract. sleep for 60 seconds")
                     time.sleep(60)
+                else:
+                    timeOutCount=0
                 time.sleep(1)
             except TypeError as ex:
                 keepProcessing=False
@@ -318,6 +328,6 @@ try:
 
     testSuccessful=True
 finally:
-    TestHelper.shutdown(cluster, walletMgr, testSuccessful, killEosInstances, killWallet, keepLogs, killAll, dumpErrorDetails)
+    TestHelper.shutdown(cluster, walletMgr, testSuccessful=testSuccessful, killEosInstances=killEosInstances, killWallet=killWallet, keepLogs=keepLogs, cleanRun=killAll, dumpErrorDetails=dumpErrorDetails)
 
 exit(0)
