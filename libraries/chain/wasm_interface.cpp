@@ -11,6 +11,7 @@
 #include <eosio/chain/wasm_eosio_validation.hpp>
 #include <eosio/chain/wasm_eosio_injection.hpp>
 #include <eosio/chain/global_property_object.hpp>
+#include <eosio/chain/protocol_state_object.hpp>
 #include <eosio/chain/account_object.hpp>
 #include <fc/exception/exception.hpp>
 #include <fc/crypto/sha256.hpp>
@@ -28,7 +29,7 @@ namespace eosio { namespace chain {
    using namespace webassembly;
    using namespace webassembly::common;
 
-   wasm_interface::wasm_interface(vm_type vm) : my( new wasm_interface_impl(vm) ) {}
+   wasm_interface::wasm_interface(vm_type vm, const chainbase::database& d) : my( new wasm_interface_impl(vm, d) ) {}
 
    wasm_interface::~wasm_interface() {}
 
@@ -46,7 +47,9 @@ namespace eosio { namespace chain {
       wasm_validations::wasm_binary_validation validator(control, module);
       validator.validate();
 
-      root_resolver resolver(true);
+      const auto& pso = control.db().get<protocol_state_object>();
+
+      root_resolver resolver( pso.whitelisted_intrinsics );
       LinkResult link_result = linkModule(module, resolver);
 
       //there are a couple opportunties for improvement here--
@@ -54,8 +57,20 @@ namespace eosio { namespace chain {
       //Hard: Kick off instantiation in a separate thread at this location
 	 }
 
-   void wasm_interface::apply( const digest_type& code_id, const shared_string& code, apply_context& context ) {
-      my->get_instantiated_module(code_id, code, context.trx_context)->apply(context);
+   void wasm_interface::indicate_shutting_down() {
+      my->is_shutting_down = true;
+   }
+
+   void wasm_interface::code_block_num_last_used(const digest_type& code_hash, const uint8_t& vm_type, const uint8_t& vm_version, const uint32_t& block_num) {
+      my->code_block_num_last_used(code_hash, vm_type, vm_version, block_num);
+   }
+
+   void wasm_interface::current_lib(const uint32_t lib) {
+      my->current_lib(lib);
+   }
+
+   void wasm_interface::apply( const digest_type& code_hash, const uint8_t& vm_type, const uint8_t& vm_version, apply_context& context ) {
+      my->get_instantiated_module(code_hash, vm_type, vm_version, context.trx_context)->apply(context);
    }
 
    void wasm_interface::exit() {
@@ -74,9 +89,8 @@ class context_aware_api {
       context_aware_api(apply_context& ctx, bool context_free = false )
       :context(ctx)
       {
-         if( context.context_free )
+         if( context.is_context_free() )
             EOS_ASSERT( context_free, unaccessible_api, "only context free api's can be used in this context" );
-         context.used_context_free_api |= !context_free;
       }
 
       void checktime() {
@@ -93,7 +107,7 @@ class context_free_api : public context_aware_api {
       context_free_api( apply_context& ctx )
       :context_aware_api(ctx, true) {
          /* the context_free_data is not available during normal application because it is prunable */
-         EOS_ASSERT( context.context_free, unaccessible_api, "this API may only be called from context_free apply" );
+         EOS_ASSERT( context.is_context_free(), unaccessible_api, "this API may only be called from context_free apply" );
       }
 
       int get_context_free_data( uint32_t index, array_ptr<char> buffer, size_t buffer_size )const {
@@ -106,7 +120,7 @@ class privileged_api : public context_aware_api {
       privileged_api( apply_context& ctx )
       :context_aware_api(ctx)
       {
-         EOS_ASSERT( context.privileged, unaccessible_api, "${code} does not have permission to call this API", ("code",context.receiver) );
+         EOS_ASSERT( context.is_privileged(), unaccessible_api, "${code} does not have permission to call this API", ("code",context.get_receiver()) );
       }
 
       /**
@@ -128,6 +142,15 @@ class privileged_api : public context_aware_api {
        */
       void activate_feature( int64_t feature_name ) {
          EOS_ASSERT( false, unsupported_feature, "Unsupported Hardfork Detected" );
+      }
+
+      /**
+       *  Pre-activates the specified protocol feature.
+       *  Fails if the feature is unrecognized, disabled, or not allowed to be activated at the current time.
+       *  Also fails if the feature was already activated or pre-activated.
+       */
+      void preactivate_feature( const digest_type& feature_digest ) {
+         context.control.preactivate_feature( feature_digest );
       }
 
       /**
@@ -156,6 +179,13 @@ class privileged_api : public context_aware_api {
          datastream<const char*> ds( packed_producer_schedule, datalen );
          vector<producer_key> producers;
          fc::raw::unpack(ds, producers);
+         EOS_ASSERT( producers.size() > 0
+                        || !context.control.is_builtin_activated(
+                              builtin_protocol_feature_t::disallow_empty_producer_schedule
+                           ),
+                     wasm_execution_error,
+                     "Producer schedule cannot be empty"
+         );
          EOS_ASSERT(producers.size() <= config::max_producers, wasm_execution_error, "Producer schedule exceeds the maximum producer count for this chain");
          // check that producers are unique
          std::set<account_name> unique_producers;
@@ -194,13 +224,13 @@ class privileged_api : public context_aware_api {
       }
 
       bool is_privileged( account_name n )const {
-         return context.db.get<account_object, by_name>( n ).privileged;
+         return context.db.get<account_metadata_object, by_name>( n ).is_privileged();
       }
 
       void set_privileged( account_name n, bool is_priv ) {
-         const auto& a = context.db.get<account_object, by_name>( n );
+         const auto& a = context.db.get<account_metadata_object, by_name>( n );
          context.db.modify( a, [&]( auto& ma ){
-            ma.privileged = is_priv;
+            ma.set_privileged( is_priv );
          });
       }
 
@@ -903,6 +933,16 @@ class system_api : public context_aware_api {
          return static_cast<uint64_t>( context.trx_context.published.time_since_epoch().count() );
       }
 
+      /**
+       * Returns true if the specified protocol feature is activated, false if not.
+       */
+      bool is_feature_activated( const digest_type& feature_digest ) {
+         return context.control.is_protocol_feature_activated( feature_digest );
+      }
+
+      name get_sender() {
+         return context.get_sender();
+      }
 };
 
 constexpr size_t max_assert_message = 1024;
@@ -935,8 +975,23 @@ public:
 
    void eosio_assert_code( bool condition, uint64_t error_code ) {
       if( BOOST_UNLIKELY( !condition ) ) {
-         EOS_THROW( eosio_assert_code_exception,
-                    "assertion failure with error code: ${error_code}", ("error_code", error_code) );
+         if( error_code >= static_cast<uint64_t>(system_error_code::generic_system_error) ) {
+            restricted_error_code_exception e( FC_LOG_MESSAGE(
+                                                   error,
+                                                   "eosio_assert_code called with reserved error code: ${error_code}",
+                                                   ("error_code", error_code)
+            ) );
+            e.error_code = static_cast<uint64_t>(system_error_code::contract_restricted_error_code);
+            throw e;
+         } else {
+            eosio_assert_code_exception e( FC_LOG_MESSAGE(
+                                             error,
+                                             "assertion failure with error code: ${error_code}",
+                                             ("error_code", error_code)
+            ) );
+            e.error_code = error_code;
+            throw e;
+         }
       }
    }
 
@@ -952,21 +1007,21 @@ class action_api : public context_aware_api {
       :context_aware_api(ctx,true){}
 
       int read_action_data(array_ptr<char> memory, size_t buffer_size) {
-         auto s = context.act.data.size();
+         auto s = context.get_action().data.size();
          if( buffer_size == 0 ) return s;
 
          auto copy_size = std::min( buffer_size, s );
-         memcpy( memory, context.act.data.data(), copy_size );
+         memcpy( memory, context.get_action().data.data(), copy_size );
 
          return copy_size;
       }
 
       int action_data_size() {
-         return context.act.data.size();
+         return context.get_action().data.size();
       }
 
       name current_receiver() {
-         return context.receiver;
+         return context.get_receiver();
       }
 };
 
@@ -1108,10 +1163,10 @@ class console_api : public context_aware_api {
 
 #define DB_API_METHOD_WRAPPERS_SIMPLE_SECONDARY(IDX, TYPE)\
       int db_##IDX##_store( uint64_t scope, uint64_t table, uint64_t payer, uint64_t id, const TYPE& secondary ) {\
-         return context.IDX.store( scope, table, payer, id, secondary );\
+         return context.IDX.store( scope, table, account_name(payer), id, secondary );\
       }\
       void db_##IDX##_update( int iterator, uint64_t payer, const TYPE& secondary ) {\
-         return context.IDX.update( iterator, payer, secondary );\
+         return context.IDX.update( iterator, account_name(payer), secondary );\
       }\
       void db_##IDX##_remove( int iterator ) {\
          return context.IDX.remove( iterator );\
@@ -1144,14 +1199,14 @@ class console_api : public context_aware_api {
                     db_api_exception,\
                     "invalid size of secondary key array for " #IDX ": given ${given} bytes but expected ${expected} bytes",\
                     ("given",data_len)("expected",ARR_SIZE) );\
-         return context.IDX.store(scope, table, payer, id, data.value);\
+         return context.IDX.store(scope, table, account_name(payer), id, data.value);\
       }\
       void db_##IDX##_update( int iterator, uint64_t payer, array_ptr<const ARR_ELEMENT_TYPE> data, size_t data_len ) {\
          EOS_ASSERT( data_len == ARR_SIZE,\
                     db_api_exception,\
                     "invalid size of secondary key array for " #IDX ": given ${given} bytes but expected ${expected} bytes",\
                     ("given",data_len)("expected",ARR_SIZE) );\
-         return context.IDX.update(iterator, payer, data.value);\
+         return context.IDX.update(iterator, account_name(payer), data.value);\
       }\
       void db_##IDX##_remove( int iterator ) {\
          return context.IDX.remove(iterator);\
@@ -1197,11 +1252,11 @@ class console_api : public context_aware_api {
 #define DB_API_METHOD_WRAPPERS_FLOAT_SECONDARY(IDX, TYPE)\
       int db_##IDX##_store( uint64_t scope, uint64_t table, uint64_t payer, uint64_t id, const TYPE& secondary ) {\
          EOS_ASSERT( !softfloat_api::is_nan( secondary ), transaction_exception, "NaN is not an allowed value for a secondary key" );\
-         return context.IDX.store( scope, table, payer, id, secondary );\
+         return context.IDX.store( scope, table, account_name(payer), id, secondary );\
       }\
       void db_##IDX##_update( int iterator, uint64_t payer, const TYPE& secondary ) {\
          EOS_ASSERT( !softfloat_api::is_nan( secondary ), transaction_exception, "NaN is not an allowed value for a secondary key" );\
-         return context.IDX.update( iterator, payer, secondary );\
+         return context.IDX.update( iterator, account_name(payer), secondary );\
       }\
       void db_##IDX##_remove( int iterator ) {\
          return context.IDX.remove( iterator );\
@@ -1236,10 +1291,10 @@ class database_api : public context_aware_api {
       using context_aware_api::context_aware_api;
 
       int db_store_i64( uint64_t scope, uint64_t table, uint64_t payer, uint64_t id, array_ptr<const char> buffer, size_t buffer_size ) {
-         return context.db_store_i64( scope, table, payer, id, buffer, buffer_size );
+         return context.db_store_i64( name(scope), name(table), account_name(payer), id, buffer, buffer_size );
       }
       void db_update_i64( int itr, uint64_t payer, array_ptr<const char> buffer, size_t buffer_size ) {
-         context.db_update_i64( itr, payer, buffer, buffer_size );
+         context.db_update_i64( itr, account_name(payer), buffer, buffer_size );
       }
       void db_remove_i64( int itr ) {
          context.db_remove_i64( itr );
@@ -1254,16 +1309,16 @@ class database_api : public context_aware_api {
          return context.db_previous_i64(itr, primary);
       }
       int db_find_i64( uint64_t code, uint64_t scope, uint64_t table, uint64_t id ) {
-         return context.db_find_i64( code, scope, table, id );
+         return context.db_find_i64( name(code), name(scope), name(table), id );
       }
       int db_lowerbound_i64( uint64_t code, uint64_t scope, uint64_t table, uint64_t id ) {
-         return context.db_lowerbound_i64( code, scope, table, id );
+         return context.db_lowerbound_i64( name(code), name(scope), name(table), id );
       }
       int db_upperbound_i64( uint64_t code, uint64_t scope, uint64_t table, uint64_t id ) {
-         return context.db_upperbound_i64( code, scope, table, id );
+         return context.db_upperbound_i64( name(code), name(scope), name(table), id );
       }
       int db_end_i64( uint64_t code, uint64_t scope, uint64_t table ) {
-         return context.db_end_i64( code, scope, table );
+         return context.db_end_i64( name(code), name(scope), name(table) );
       }
 
       DB_API_METHOD_WRAPPERS_SIMPLE_SECONDARY(idx64,  uint64_t)
@@ -1702,6 +1757,7 @@ REGISTER_INTRINSICS(privileged_api,
    (set_blockchain_parameters_packed, void(int,int)                         )
    (is_privileged,                    int(int64_t)                          )
    (set_privileged,                   void(int64_t, int)                    )
+   (preactivate_feature,              void(int)                             )
 );
 
 REGISTER_INJECTED_INTRINSICS(transaction_context,
@@ -1778,8 +1834,10 @@ REGISTER_INTRINSICS(permission_api,
 
 
 REGISTER_INTRINSICS(system_api,
-   (current_time, int64_t()       )
-   (publication_time,   int64_t() )
+   (current_time,          int64_t() )
+   (publication_time,      int64_t() )
+   (is_feature_activated,  int(int)  )
+   (get_sender,            int64_t() )
 );
 
 REGISTER_INTRINSICS(context_free_system_api,

@@ -65,7 +65,7 @@
         "net"
       ]
     },{
-      "name": "bnet_plugin",
+      "name": "http_plugin",
       "level": "debug",
       "enabled": true,
       "additivity": false,
@@ -76,6 +76,15 @@
     },{
       "name": "producer_plugin",
       "level": "debug",
+      "enabled": true,
+      "additivity": false,
+      "appenders": [
+        "stderr",
+        "net"
+      ]
+    },{
+      "name": "transaction_tracing",
+      "level": "info",
       "enabled": true,
       "additivity": false,
       "appenders": [

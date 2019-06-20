@@ -15,6 +15,39 @@ from sys import exit
 import traceback
 
 ###########################################################################################
+
+def addEnum(enumClassType, type):
+    setattr(enumClassType, type, enumClassType(type))
+
+def unhandledEnumType(type):
+    raise RuntimeError("No case defined for type=%s" % (type.type))
+
+class EnumType:
+
+    def __init__(self, type):
+        self.type=type
+
+    def __str__(self):
+        return self.type
+
+
+class ReturnType(EnumType):
+    pass
+
+addEnum(ReturnType, "raw")
+addEnum(ReturnType, "json")
+
+###########################################################################################
+
+class BlockLogAction(EnumType):
+    pass
+
+addEnum(BlockLogAction, "make_index")
+addEnum(BlockLogAction, "trim")
+addEnum(BlockLogAction, "smoke_test")
+addEnum(BlockLogAction, "return_blocks")
+
+###########################################################################################
 class Utils:
     Debug=False
     FNull = open(os.devnull, 'w')
@@ -119,8 +152,10 @@ class Utils:
 
     @staticmethod
     def checkOutput(cmd, ignoreError=False):
-        assert(isinstance(cmd, list))
-        popen=subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if (isinstance(cmd, list)):
+            popen=subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        else:
+            popen=subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=True)
         (output,error)=popen.communicate()
         Utils.CheckOutputDeque.append((output,error,cmd))
         if popen.returncode != 0 and not ignoreError:
@@ -142,7 +177,7 @@ class Utils:
         Utils.Print(msg)
 
     @staticmethod
-    def waitForObj(lam, timeout=None):
+    def waitForObj(lam, timeout=None, sleepTime=3, reporter=None):
         if timeout is None:
             timeout=60
 
@@ -153,7 +188,6 @@ class Utils:
                 ret=lam()
                 if ret is not None:
                     return ret
-                sleepTime=3
                 if Utils.Debug:
                     Utils.Print("cmd: sleep %d seconds, remaining time: %d seconds" %
                                 (sleepTime, endTime - time.time()))
@@ -161,6 +195,8 @@ class Utils:
                     stdout.write('.')
                     stdout.flush()
                     needsNewLine=True
+                if reporter is not None:
+                    reporter()
                 time.sleep(sleepTime)
         finally:
             if needsNewLine:
@@ -169,9 +205,9 @@ class Utils:
         return None
 
     @staticmethod
-    def waitForBool(lam, timeout=None):
+    def waitForBool(lam, timeout=None, sleepTime=3, reporter=None):
         myLam = lambda: True if lam() else None
-        ret=Utils.waitForObj(myLam, timeout)
+        ret=Utils.waitForObj(myLam, timeout, sleepTime, reporter=reporter)
         return False if ret is None else ret
 
     @staticmethod
@@ -215,6 +251,11 @@ class Utils:
     @staticmethod
     def runCmdReturnStr(cmd, trace=False):
         cmdArr=shlex.split(cmd)
+        return Utils.runCmdArrReturnStr(cmdArr)
+
+
+    @staticmethod
+    def runCmdArrReturnStr(cmdArr, trace=False):
         retStr=Utils.checkOutput(cmdArr)
         if trace: Utils.Print ("RAW > %s" % (retStr))
         return retStr
@@ -268,14 +309,37 @@ class Utils:
         return "pgrep %s %s" % (pgrepOpts, serverName)
 
     @staticmethod
-    def getBlockLog(blockLogLocation, silentErrors=False, exitOnError=False):
+    def getBlockLog(blockLogLocation, blockLogAction=BlockLogAction.return_blocks, outputFile=None, first=None, last=None, throwException=False, silentErrors=False, exitOnError=False):
         assert(isinstance(blockLogLocation, str))
-        cmd="%s --blocks-dir %s --as-json-array" % (Utils.EosBlockLogPath, blockLogLocation)
+        outputFileStr=" --output-file %s " % (outputFile) if outputFile is not None else ""
+        firstStr=" --first %s " % (first) if first is not None else ""
+        lastStr=" --last %s " % (last) if last is not None else ""
+
+        blockLogActionStr=None
+        returnType=ReturnType.raw
+        if blockLogAction==BlockLogAction.return_blocks:
+            blockLogActionStr=""
+            returnType=ReturnType.json
+        elif blockLogAction==BlockLogAction.make_index:
+            blockLogActionStr=" --make-index "
+        elif blockLogAction==BlockLogAction.trim:
+            blockLogActionStr=" --trim "
+        elif blockLogAction==BlockLogAction.smoke_test:
+            blockLogActionStr=" --smoke-test "
+        else:
+            unhandledEnumType(blockLogAction)
+
+        cmd="%s --blocks-dir %s --as-json-array %s%s%s%s" % (Utils.EosBlockLogPath, blockLogLocation, outputFileStr, firstStr, lastStr, blockLogActionStr)
         if Utils.Debug: Utils.Print("cmd: %s" % (cmd))
         rtn=None
         try:
-            rtn=Utils.runCmdReturnJson(cmd, silentErrors=silentErrors)
+            if returnType==ReturnType.json:
+                rtn=Utils.runCmdReturnJson(cmd, silentErrors=silentErrors)
+            else:
+                rtn=Utils.runCmdReturnStr(cmd)
         except subprocess.CalledProcessError as ex:
+            if throwException:
+                raise
             if not silentErrors:
                 msg=ex.output.decode("utf-8")
                 errorMsg="Exception during \"%s\". %s" % (cmd, msg)
@@ -370,18 +434,3 @@ class Account(object):
     def __str__(self):
         return "Name: %s" % (self.name)
 
-###########################################################################################
-
-def addEnum(enumClassType, type):
-    setattr(enumClassType, type, enumClassType(type))
-
-def unhandledEnumType(type):
-    raise RuntimeError("No case defined for type=%s" % (type.type))
-
-class EnumType:
-
-    def __init__(self, type):
-        self.type=type
-
-    def __str__(self):
-        return self.type

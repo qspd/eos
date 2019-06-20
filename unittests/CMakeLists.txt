@@ -33,8 +33,6 @@ find_package(LLVM 4.0 REQUIRED CONFIG)
 
 link_directories(${LLVM_LIBRARY_DIR})
 
-set( CMAKE_CXX_STANDARD 14 )
-
 add_subdirectory(contracts)
 
 configure_file(${CMAKE_CURRENT_SOURCE_DIR}/contracts.hpp.in ${CMAKE_CURRENT_BINARY_DIR}/include/contracts.hpp ESCAPE_QUOTES)
@@ -42,7 +40,9 @@ configure_file(${CMAKE_CURRENT_SOURCE_DIR}/contracts.hpp.in ${CMAKE_CURRENT_BINA
 ### BUILD UNIT TEST EXECUTABLE ###
 file(GLOB UNIT_TESTS "*.cpp") # find all unit test suites
 add_executable( unit_test ${UNIT_TESTS}) # build unit tests as one executable
+
 target_link_libraries( unit_test eosio_chain chainbase eosio_testing fc appbase ${PLATFORM_SPECIFIC_LIBS} )
+
 target_compile_options(unit_test PUBLIC -DDISABLE_EOSLIB_SERIALIZE)
 target_include_directories( unit_test PUBLIC
                             ${CMAKE_SOURCE_DIR}/libraries/testing/include
@@ -69,6 +69,12 @@ foreach(TEST_SUITE ${UNIT_TESTS}) # create an independent target for each test s
   endif()
 endforeach(TEST_SUITE)
 set(ctest_tests "'${ctest_tests}' -j8") # surround test list string in apostrophies
+
+# The following tests are known to take the longest, bump up their cost (priority) so that they'll run first
+# even on fresh first time test runs before ctest auto-detects costs
+set_tests_properties(api_unit_test_wavm api_unit_test_wabt PROPERTIES COST 5000)
+set_tests_properties(wasm_unit_test_wavm wasm_unit_test_wabt PROPERTIES COST 4000)
+set_tests_properties(delay_unit_test_wavm delay_unit_test_wabt PROPERTIES COST 3000)
 
 ### COVERAGE TESTING ###
 if(ENABLE_COVERAGE_TESTING)

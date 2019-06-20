@@ -7,12 +7,14 @@
 #include <eosio/chain/authority_checker.hpp>
 #include <eosio/chain/chain_config.hpp>
 #include <eosio/chain/types.hpp>
+#include <eosio/chain/thread_utils.hpp>
 #include <eosio/testing/tester.hpp>
 
 #include <fc/io/json.hpp>
+#include <fc/log/logger_config.hpp>
 #include <appbase/execution_priority_queue.hpp>
+#include <fc/bitutil.hpp>
 
-#include <boost/asio/thread_pool.hpp>
 #include <boost/test/unit_test.hpp>
 
 #ifdef NON_VALIDATING_TEST
@@ -86,7 +88,8 @@ namespace eosio
 using namespace chain;
 using namespace std;
 
-static constexpr uint64_t name_suffix( uint64_t n ) {
+static constexpr uint64_t name_suffix( name nv ) {
+   uint64_t n = nv.to_uint64_t();
    uint32_t remaining_bits_after_last_actual_dot = 0;
    uint32_t tmp = 0;
    for( int32_t remaining_bits = 59; remaining_bits >= 4; remaining_bits -= 5 ) { // Note: remaining_bits must remain signed integer
@@ -118,9 +121,17 @@ static constexpr uint64_t name_suffix( uint64_t n ) {
 
 BOOST_AUTO_TEST_SUITE(misc_tests)
 
+BOOST_AUTO_TEST_CASE(reverse_endian_tests)
+{
+    BOOST_CHECK_EQUAL( endian_reverse_u64(0x0123456789abcdef), 0xefcdab8967452301 );
+    BOOST_CHECK_EQUAL( endian_reverse_u64(0x0102030405060708), 0x0807060504030201 );
+    BOOST_CHECK_EQUAL( endian_reverse_u32(0x01234567), 0x67452301 );
+    BOOST_CHECK_EQUAL( endian_reverse_u32(0x01020304), 0x04030201 );
+}
+
 BOOST_AUTO_TEST_CASE(name_suffix_tests)
 {
-   BOOST_CHECK_EQUAL( name{name_suffix(0)}, name{0} );
+   BOOST_CHECK_EQUAL( name{name_suffix(name(0))}, name{0} );
    BOOST_CHECK_EQUAL( name{name_suffix(N(abcdehijklmn))}, name{N(abcdehijklmn)} );
    BOOST_CHECK_EQUAL( name{name_suffix(N(abcdehijklmn1))}, name{N(abcdehijklmn1)} );
    BOOST_CHECK_EQUAL( name{name_suffix(N(abc.def))}, name{N(def)} );
@@ -316,9 +327,9 @@ struct permission_visitor {
 BOOST_AUTO_TEST_CASE(authority_checker)
 { try {
    testing::TESTER test;
-   auto a = test.get_public_key("a", "active");
-   auto b = test.get_public_key("b", "active");
-   auto c = test.get_public_key("c", "active");
+   auto a = test.get_public_key(name("a"), "active");
+   auto b = test.get_public_key(name("b"), "active");
+   auto c = test.get_public_key(name("c"), "active");
 
    auto GetNullAuthority = [](auto){abort(); return authority();};
 
@@ -374,7 +385,7 @@ BOOST_AUTO_TEST_CASE(authority_checker)
       return authority(1, {key_weight{c, 1}});
    };
 
-   A = authority(2, {key_weight{a, 2}, key_weight{b, 1}}, {permission_level_weight{{"hello",  "world"}, 1}});
+   A = authority(2, {key_weight{a, 2}, key_weight{b, 1}}, {permission_level_weight{{name("hello"), name("world")}, 1}});
    {
       auto checker = make_auth_checker(GetCAuthority, 2, {a});
       BOOST_TEST(checker.satisfied(A));
@@ -414,7 +425,7 @@ BOOST_AUTO_TEST_CASE(authority_checker)
       BOOST_TEST(checker.unused_keys().count(c) == 1u);
    }
 
-   A = authority(3, {key_weight{a, 2}, key_weight{b, 1}}, {permission_level_weight{{"hello",  "world"}, 3}});
+   A = authority(3, {key_weight{a, 2}, key_weight{b, 1}}, {permission_level_weight{{name("hello"), name("world")}, 3}});
    {
       auto checker = make_auth_checker(GetCAuthority, 2, {a, b});
       BOOST_TEST(checker.satisfied(A));
@@ -431,7 +442,7 @@ BOOST_AUTO_TEST_CASE(authority_checker)
       BOOST_TEST(checker.unused_keys().count(b) == 1u);
    }
 
-   A = authority(2, {key_weight{a, 1}, key_weight{b, 1}}, {permission_level_weight{{"hello",  "world"}, 1}});
+   A = authority(2, {key_weight{a, 1}, key_weight{b, 1}}, {permission_level_weight{{name("hello"), name("world")}, 1}});
    BOOST_TEST(!make_auth_checker(GetCAuthority, 2, {a}).satisfied(A));
    BOOST_TEST(!make_auth_checker(GetCAuthority, 2, {b}).satisfied(A));
    BOOST_TEST(!make_auth_checker(GetCAuthority, 2, {c}).satisfied(A));
@@ -447,7 +458,7 @@ BOOST_AUTO_TEST_CASE(authority_checker)
       BOOST_TEST(checker.unused_keys().count(c) == 1u);
    }
 
-   A = authority(2, {key_weight{a, 1}, key_weight{b, 1}}, {permission_level_weight{{"hello",  "world"}, 2}});
+   A = authority(2, {key_weight{a, 1}, key_weight{b, 1}}, {permission_level_weight{{name("hello"), name("world")}, 2}});
    BOOST_TEST(make_auth_checker(GetCAuthority, 2, {a, b}).satisfied(A));
    BOOST_TEST(make_auth_checker(GetCAuthority, 2, {c}).satisfied(A));
    BOOST_TEST(!make_auth_checker(GetCAuthority, 2, {a}).satisfied(A));
@@ -461,16 +472,16 @@ BOOST_AUTO_TEST_CASE(authority_checker)
       BOOST_TEST(checker.used_keys().count(c) == 1u);
    }
 
-   auto d = test.get_public_key("d", "active");
-   auto e = test.get_public_key("e", "active");
+   auto d = test.get_public_key(name("d"), "active");
+   auto e = test.get_public_key(name("e"), "active");
 
    auto GetAuthority = [d, e] (const permission_level& perm) {
-      if (perm.actor == "top")
-         return authority(2, {key_weight{d, 1}}, {permission_level_weight{{"bottom",  "bottom"}, 1}});
+      if (perm.actor == name("top"))
+         return authority(2, {key_weight{d, 1}}, {permission_level_weight{{name("bottom"), name("bottom")}, 1}});
       return authority{1, {{e, 1}}, {}};
    };
 
-   A = authority(5, {key_weight{a, 2}, key_weight{b, 2}, key_weight{c, 2}}, {permission_level_weight{{"top",  "top"}, 5}});
+   A = authority(5, {key_weight{a, 2}, key_weight{b, 2}, key_weight{c, 2}}, {permission_level_weight{{name("top"), name("top")}, 5}});
    {
       auto checker = make_auth_checker(GetAuthority, 2, {d, e});
       BOOST_TEST(checker.satisfied(A));
@@ -537,38 +548,38 @@ BOOST_AUTO_TEST_CASE(authority_checker)
    }
    {
       auto A2 = authority(4, {key_weight{b, 1}, key_weight{a, 1}, key_weight{c, 1}},
-                          { permission_level_weight{{"a",  "world"},     1},
-                            permission_level_weight{{"hello",  "world"}, 1},
-                            permission_level_weight{{"hi",  "world"},    1}
+                          { permission_level_weight{{name("a"), name("world")},     1},
+                            permission_level_weight{{name("hello"), name("world")}, 1},
+                            permission_level_weight{{name("hi"), name("world")},    1}
                           });
       auto B2 = authority(4, {key_weight{b, 1}, key_weight{a, 1}, key_weight{c, 1}},
-                          {permission_level_weight{{"hello",  "world"}, 1}
+                          {permission_level_weight{{name("hello"), name("world")}, 1}
                           });
       auto C2 = authority(4, {key_weight{b, 1}, key_weight{a, 1}, key_weight{c, 1}},
-                          { permission_level_weight{{"hello",  "there"}, 1},
-                            permission_level_weight{{"hello",  "world"}, 1}
+                          { permission_level_weight{{name("hello"), name("there")}, 1},
+                            permission_level_weight{{name("hello"), name("world")}, 1}
                           });
       // invalid: duplicate
       auto D2 = authority(4, {key_weight{b, 1}, key_weight{a, 1}, key_weight{c, 1}},
-                          { permission_level_weight{{"hello",  "world"}, 1},
-                            permission_level_weight{{"hello",  "world"}, 2}
+                          { permission_level_weight{{name("hello"), name("world")}, 1},
+                            permission_level_weight{{name("hello"), name("world")}, 2}
                           });
       // invalid: wrong order
       auto E2 = authority(4, {key_weight{b, 1}, key_weight{a, 1}, key_weight{c, 1}},
-                          { permission_level_weight{{"hello",  "world"}, 2},
-                            permission_level_weight{{"hello",  "there"}, 1}
+                          { permission_level_weight{{name("hello"), name("world")}, 2},
+                            permission_level_weight{{name("hello"), name("there")}, 1}
                           });
       // invalid: wrong order
       auto F2 = authority(4, {key_weight{b, 1}, key_weight{a, 1}, key_weight{c, 1}},
-                          { permission_level_weight{{"hi",  "world"}, 2},
-                            permission_level_weight{{"hello",  "world"}, 1}
+                          { permission_level_weight{{name("hi"), name("world")}, 2},
+                            permission_level_weight{{name("hello"), name("world")}, 1}
                           });
 
       // invalid: insufficient weight
       auto G2 = authority(7, {key_weight{b, 1}, key_weight{a, 1}, key_weight{c, 1}},
-                             { permission_level_weight{{"a",  "world"},     1},
-                               permission_level_weight{{"hello",  "world"}, 1},
-                               permission_level_weight{{"hi",  "world"},    1}
+                             { permission_level_weight{{name("a"), name("world")},     1},
+                               permission_level_weight{{name("hello"), name("world")}, 1},
+                               permission_level_weight{{name("hi"), name("world")},    1}
                              });
 
       BOOST_TEST(validate(A2));
@@ -613,7 +624,7 @@ BOOST_AUTO_TEST_CASE(alphabetic_sort)
   vector<uint64_t> uwords;
   for(const auto w: words) {
     auto n = name(w.c_str());
-    uwords.push_back(n.value);
+    uwords.push_back(n.to_uint64_t());
   }
 
   std::sort(uwords.begin(), uwords.end(), std::less<uint64_t>());
@@ -826,37 +837,44 @@ BOOST_AUTO_TEST_CASE(transaction_metadata_test) { try {
 
       BOOST_CHECK_EQUAL(trx.id(), pkt.id());
       BOOST_CHECK_EQUAL(trx.id(), pkt2.id());
-      BOOST_CHECK_EQUAL(trx.id(), mtrx->id);
-      BOOST_CHECK_EQUAL(trx.id(), mtrx2->id);
+      BOOST_CHECK_EQUAL(trx.id(), mtrx->id());
+      BOOST_CHECK_EQUAL(trx.id(), mtrx2->id());
 
-      boost::asio::thread_pool thread_pool(5);
+      named_thread_pool thread_pool( "misc", 5 );
 
-      BOOST_CHECK( !mtrx->signing_keys_future.valid() );
-      BOOST_CHECK( !mtrx2->signing_keys_future.valid() );
-
-      transaction_metadata::create_signing_keys_future( mtrx, thread_pool, test.control->get_chain_id(), fc::microseconds::maximum() );
-      transaction_metadata::create_signing_keys_future( mtrx2, thread_pool, test.control->get_chain_id(), fc::microseconds::maximum() );
-
-      BOOST_CHECK( mtrx->signing_keys_future.valid() );
-      BOOST_CHECK( mtrx2->signing_keys_future.valid() );
+      transaction_metadata::start_recover_keys( mtrx, thread_pool.get_executor(), test.control->get_chain_id(), fc::microseconds::maximum() );
+      transaction_metadata::start_recover_keys( mtrx2, thread_pool.get_executor(), test.control->get_chain_id(), fc::microseconds::maximum() );
 
       // no-op
-      transaction_metadata::create_signing_keys_future( mtrx, thread_pool, test.control->get_chain_id(), fc::microseconds::maximum() );
-      transaction_metadata::create_signing_keys_future( mtrx2, thread_pool, test.control->get_chain_id(), fc::microseconds::maximum() );
+      transaction_metadata::start_recover_keys( mtrx, thread_pool.get_executor(), test.control->get_chain_id(), fc::microseconds::maximum() );
+      transaction_metadata::start_recover_keys( mtrx2, thread_pool.get_executor(), test.control->get_chain_id(), fc::microseconds::maximum() );
 
       auto keys = mtrx->recover_keys( test.control->get_chain_id() );
-      BOOST_CHECK_EQUAL(1u, keys.size());
-      BOOST_CHECK_EQUAL(public_key, *keys.begin());
+      BOOST_CHECK_EQUAL(1u, keys.second->size());
+      BOOST_CHECK_EQUAL(public_key, *keys.second->begin());
 
       // again
-      keys = mtrx->recover_keys( test.control->get_chain_id() );
-      BOOST_CHECK_EQUAL(1u, keys.size());
-      BOOST_CHECK_EQUAL(public_key, *keys.begin());
+      auto keys2 = mtrx->recover_keys( test.control->get_chain_id() );
+      BOOST_CHECK_EQUAL(1u, keys2.second->size());
+      BOOST_CHECK_EQUAL(public_key, *keys2.second->begin());
 
-      auto keys2 = mtrx2->recover_keys( test.control->get_chain_id() );
-      BOOST_CHECK_EQUAL(1u, keys.size());
-      BOOST_CHECK_EQUAL(public_key, *keys.begin());
+      auto keys3 = mtrx2->recover_keys( test.control->get_chain_id() );
+      BOOST_CHECK_EQUAL(1u, keys3.second->size());
+      BOOST_CHECK_EQUAL(public_key, *keys3.second->begin());
 
+      // recover keys without first calling start_recover_keys
+      transaction_metadata_ptr mtrx4 = std::make_shared<transaction_metadata>( std::make_shared<packed_transaction>( trx, packed_transaction::none) );
+      transaction_metadata_ptr mtrx5 = std::make_shared<transaction_metadata>( std::make_shared<packed_transaction>( trx, packed_transaction::zlib) );
+
+      auto keys4 = mtrx4->recover_keys( test.control->get_chain_id() );
+      BOOST_CHECK_EQUAL(1u, keys4.second->size());
+      BOOST_CHECK_EQUAL(public_key, *keys4.second->begin());
+
+      auto keys5 = mtrx5->recover_keys( test.control->get_chain_id() );
+      BOOST_CHECK_EQUAL(1u, keys5.second->size());
+      BOOST_CHECK_EQUAL(public_key, *keys5.second->begin());
+
+      thread_pool.stop();
 
 } FC_LOG_AND_RETHROW() }
 
